@@ -5,6 +5,7 @@
  * on Data Center require no additional scopes.
  */
 import { atlassianGet } from "./httpClient.js";
+import { DEFAULT_CONCURRENCY, mapWithConcurrency } from "./concurrency.js";
 
 export interface ClientOptions {
     baseUrl: string;
@@ -35,6 +36,22 @@ export interface JiraSprintIssueSummary {
     storyPoints: number | null;
 }
 
+/**
+ * Sprint scope as Jira itself reports it, separating the original commitment
+ * from work added or removed after the sprint started. Null when the
+ * greenhopper sprint report is unavailable on this instance.
+ */
+export interface JiraSprintScope {
+    initialCommittedPoints: number | null;
+    currentScopePoints: number | null;
+    completedPoints: number | null;
+    notCompletedPoints: number | null;
+    removedPoints: number | null;
+    addedDuringSprintPoints: number;
+    addedDuringSprintKeys: string[];
+    removedKeys: string[];
+}
+
 export interface JiraSprintReport {
     sprintId: number;
     sprintName: string;
@@ -49,6 +66,8 @@ export interface JiraSprintReport {
     issueCount: number;
     issuesByStatus: Record<string, number>;
     issues: JiraSprintIssueSummary[];
+    scope: JiraSprintScope | null;
+    scopeNote: string;
 }
 
 export interface JiraVelocitySprintSummary {
@@ -163,18 +182,94 @@ export class JiraAgileClient {
         return issues;
     }
     /**
+     * Fetches Jira's own sprint report from the greenhopper API, which is the
+     * only source that distinguishes the sprint's *initial* commitment from
+     * work added after it started. Summing story points from the sprint's
+     * current issue list cannot see scope creep: an issue added on day 8 looks
+     * exactly like one committed on day 1.
+     *
+     * This endpoint is undocumented and absent or restricted on some
+     * instances, so callers must treat a null result as "unavailable" rather
+     * than an error.
+     */
+    private async getGreenhopperScope(
+        boardId: number,
+        sprintId: number,
+    ): Promise<JiraSprintScope | null> {
+        let report: any;
+        try {
+            report = await atlassianGet({
+                baseUrl: this.options.baseUrl,
+                pat: this.options.pat,
+                path: "/rest/greenhopper/1.0/rapid/charts/sprintreport",
+                query: { rapidViewId: boardId, sprintId },
+            });
+        } catch {
+            return null;
+        }
+
+        const contents = report?.contents;
+        if (!contents) return null;
+
+        const keysAddedDuringSprint = Object.keys(contents.issueKeysAddedDuringSprint || {});
+        const sum = (value: any): number | null =>
+            typeof value?.value === "number" ? round2(value.value) : null;
+
+        const completed = sum(contents.completedIssuesEstimateSum);
+        const notCompleted = sum(contents.issuesNotCompletedEstimateSum);
+        const punted = sum(contents.puntedIssuesEstimateSum);
+        const allIssues = sum(contents.allIssuesEstimateSum);
+
+        // Everything in the sprint now, minus what was added after it started.
+        const addedPoints = (contents.issuesNotCompletedInCurrentSprint || [])
+            .concat(contents.completedIssues || [])
+            .filter((issue: any) => keysAddedDuringSprint.includes(issue.key))
+            .reduce(
+                (total: number, issue: any) =>
+                    total + (typeof issue.estimateStatistic?.statFieldValue?.value === "number"
+                        ? issue.estimateStatistic.statFieldValue.value
+                        : 0),
+                0,
+            );
+
+        return {
+            initialCommittedPoints:
+                allIssues !== null ? round2(allIssues - addedPoints + (punted ?? 0)) : null,
+            currentScopePoints: allIssues,
+            completedPoints: completed,
+            notCompletedPoints: notCompleted,
+            removedPoints: punted,
+            addedDuringSprintPoints: round2(addedPoints),
+            addedDuringSprintKeys: keysAddedDuringSprint,
+            removedKeys: (contents.puntedIssues || []).map((issue: any) => issue.key),
+        };
+    }
+    /**
      * Builds a completion/velocity report for a single sprint on a board:
      * committed vs completed story points (dynamically discovering the
      * board's configured story points field), plus a per-status breakdown.
+     *
+     * `prefetched` lets callers that already hold the board's sprint list and
+     * estimation field pass them in, which is what getBoardVelocity does to
+     * avoid refetching both once per sprint.
      */
-    async getSprintReport(boardId: number, sprintId: number): Promise<JiraSprintReport> {
-        const [sprints, storyPointsInfo] = await Promise.all([
-            this.getBoardSprints(boardId),
-            this.getBoardStoryPointsField(boardId),
-        ]);
+    async getSprintReport(
+        boardId: number,
+        sprintId: number,
+        prefetched?: { sprints: JiraSprintSummary[]; storyPointsInfo: JiraStoryPointsFieldInfo },
+    ): Promise<JiraSprintReport> {
+        const [sprints, storyPointsInfo] = prefetched
+            ? [prefetched.sprints, prefetched.storyPointsInfo]
+            : await Promise.all([
+                this.getBoardSprints(boardId),
+                this.getBoardStoryPointsField(boardId),
+            ]);
         const sprint = sprints.find((s) => s.id === sprintId);
         const { fieldId: storyPointsField, fieldName: storyPointsFieldName } = storyPointsInfo;
-        const rawIssues = await this.getSprintIssues(sprintId, storyPointsField);
+        const [rawIssues, scope] = await Promise.all([
+            this.getSprintIssues(sprintId, storyPointsField),
+            this.getGreenhopperScope(boardId, sprintId),
+        ]);
         const issuesByStatus: Record<string, number> = {};
         const issues: JiraSprintIssueSummary[] = [];
         let committedPoints = 0;
@@ -223,6 +318,10 @@ export class JiraAgileClient {
             issueCount: rawIssues.length,
             issuesByStatus,
             issues,
+            scope,
+            scopeNote: scope
+                ? "`committedPoints` is the sprint's current scope. Use `scope.initialCommittedPoints` for what was actually committed at sprint start."
+                : "Jira's sprint report was unavailable, so scope added mid-sprint could not be separated out. `committedPoints` reflects current scope, not the original commitment.",
         };
     }
     /**
@@ -234,9 +333,27 @@ export class JiraAgileClient {
             this.getBoardSprints(boardId, "closed"),
             this.getBoardStoryPointsField(boardId),
         ]);
-        // Closed sprints are typically returned oldest-first; take the most recent N.
-        const recentSprints = closedSprints.slice(-numSprints).reverse();
-        const sprintReports = await Promise.all(recentSprints.map((sprint) => this.getSprintReport(boardId, sprint.id)));
+        // Sort explicitly rather than trusting the API's ordering: relying on
+        // "closed sprints come back oldest-first" silently picks the wrong
+        // sprints when it doesn't hold.
+        const orderedSprints = [...closedSprints].sort((left, right) => {
+            const leftEnd = left.endDate ? Date.parse(left.endDate) : 0;
+            const rightEnd = right.endDate ? Date.parse(right.endDate) : 0;
+            if (leftEnd !== rightEnd) return rightEnd - leftEnd;
+            return right.id - left.id;
+        });
+        const recentSprints = orderedSprints.slice(0, numSprints);
+        // Reuse the sprint list and estimation field we already fetched;
+        // otherwise each report refetches both, once per sprint.
+        const sprintReports = await mapWithConcurrency(
+            recentSprints,
+            DEFAULT_CONCURRENCY,
+            (sprint) =>
+                this.getSprintReport(boardId, sprint.id, {
+                    sprints: closedSprints,
+                    storyPointsInfo,
+                }),
+        );
         const sprints = sprintReports.map((report) => {
             const completionPercent = report.committedPoints !== null &&
                 report.committedPoints > 0 &&

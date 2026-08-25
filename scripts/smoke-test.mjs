@@ -19,12 +19,19 @@ if (!existsSync(entrypoint)) {
   process.exit(1);
 }
 
-const hasRealCredentials = Boolean(
-  process.env.JIRA_BASE_URL &&
-    process.env.JIRA_PAT &&
-    process.env.CONFLUENCE_BASE_URL &&
-    process.env.CONFLUENCE_PAT,
-);
+const envFileCandidate = process.env.ATLASSIAN_ENV_FILE
+  ? process.env.ATLASSIAN_ENV_FILE
+  : join(projectRoot, ".env");
+
+// The server loads a .env itself, so credentials may be present even when
+// they are absent from this process's environment.
+const hasRealCredentials =
+  Boolean(
+    process.env.JIRA_BASE_URL &&
+      process.env.JIRA_PAT &&
+      process.env.CONFLUENCE_BASE_URL &&
+      process.env.CONFLUENCE_PAT,
+  ) || existsSync(envFileCandidate);
 
 const env = hasRealCredentials
   ? { ...process.env }

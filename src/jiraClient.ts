@@ -8,6 +8,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
 import { atlassianDelete, atlassianGet, atlassianGetBinary, atlassianPost, atlassianPostFormData, atlassianPut, AtlassianHttpError, } from "./httpClient.js";
 import { decodeProformaDesign, formatProformaAnswer, getProformaChunkCount, } from "./proforma.js";
+import { DEFAULT_CONCURRENCY, mapWithConcurrency } from "./concurrency.js";
 
 export interface ClientOptions {
     baseUrl: string;
@@ -28,6 +29,17 @@ export interface JiraIssueSummary {
     assignee: string;
     issueType: string;
     priority: string;
+}
+
+/** A page of search results, with enough metadata to detect truncation. */
+export interface JiraIssueSearchResult {
+    startAt: number;
+    maxResults: number;
+    returned: number;
+    total: number;
+    hasMore: boolean;
+    nextStartAt: number | null;
+    issues: JiraIssueSummary[];
 }
 
 export interface JiraIssueStoryPoints {
@@ -307,8 +319,28 @@ function collectStatusTransitions(histories: any[], out: JiraStatusTransition[])
 }
 export class JiraClient {
     private readonly options: ClientOptions;
+    /**
+     * Jira's field catalogue is instance-wide, large, and changes only when an
+     * admin edits a custom field — but get_issue_fields needs it on every call.
+     * Cache it for the lifetime of a short TTL instead of refetching per call.
+     */
+    private fieldDefinitions: { fetchedAt: number; fields: any[] } | null = null;
+    private static readonly FIELD_CACHE_TTL_MS = 5 * 60 * 1000;
     constructor(options: ClientOptions) {
         this.options = options;
+    }
+    private async getFieldDefinitions(): Promise<any[]> {
+        const cached = this.fieldDefinitions;
+        if (cached && Date.now() - cached.fetchedAt < JiraClient.FIELD_CACHE_TTL_MS) {
+            return cached.fields;
+        }
+        const fields = await atlassianGet({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: "/rest/api/2/field",
+        });
+        this.fieldDefinitions = { fetchedAt: Date.now(), fields: fields || [] };
+        return this.fieldDefinitions.fields;
     }
     /**
      * Rejects any attachment path outside the configured allowlist. Paths are
@@ -340,7 +372,7 @@ export class JiraClient {
         }
         return resolved;
     }
-    async searchIssues(jql: string, maxResults = 20): Promise<JiraIssueSummary[]> {
+    async searchIssues(jql: string, maxResults = 20, startAt = 0): Promise<JiraIssueSearchResult> {
         const data = await atlassianGet({
             baseUrl: this.options.baseUrl,
             pat: this.options.pat,
@@ -348,10 +380,11 @@ export class JiraClient {
             query: {
                 jql,
                 maxResults,
+                startAt,
                 fields: "summary,status,assignee,issuetype,priority",
             },
         });
-        return (data.issues || []).map((issue: any) => ({
+        const issues: JiraIssueSummary[] = (data.issues || []).map((issue: any) => ({
             key: issue.key,
             summary: issue.fields.summary || "",
             status: issue.fields.status?.name || "Unknown",
@@ -359,6 +392,21 @@ export class JiraClient {
             issueType: issue.fields.issuetype?.name || "Unknown",
             priority: issue.fields.priority?.name || "Unknown",
         }));
+        const total = typeof data.total === "number" ? data.total : startAt + issues.length;
+        const nextStartAt = startAt + issues.length;
+        const hasMore = issues.length > 0 && nextStartAt < total;
+        // Reporting `total` and `hasMore` matters: without them a truncated
+        // result set is indistinguishable from a complete one, and conclusions
+        // get drawn from a partial answer.
+        return {
+            startAt,
+            maxResults,
+            returned: issues.length,
+            total,
+            hasMore,
+            nextStartAt: hasMore ? nextStartAt : null,
+            issues,
+        };
     }
     /**
      * Fetches story points for a set of issues by key, given a specific
@@ -418,11 +466,7 @@ export class JiraClient {
         };
     }
     async getIssueFields(issueKey: string, fieldNames: string[] = [], includeEmpty = false): Promise<JiraIssueFieldValue[]> {
-        const definitions = await atlassianGet({
-            baseUrl: this.options.baseUrl,
-            pat: this.options.pat,
-            path: "/rest/api/2/field",
-        });
+        const definitions = await this.getFieldDefinitions();
         const requested = new Set(fieldNames.map((name) => name.toLocaleLowerCase()));
         const selected = requested.size === 0
             ? definitions.filter((field: any) => !["attachment", "comment", "worklog"].includes(field.id))
@@ -507,7 +551,7 @@ export class JiraClient {
     }
     async getProformaFormsSummary(issueKey: string, includeEmpty = false): Promise<JiraProformaForm[]> {
         const forms = await this.listProformaForms(issueKey);
-        return Promise.all(forms.map((form: JiraProformaFormSummary) => this.getProformaForm(issueKey, form.id, includeEmpty)));
+        return mapWithConcurrency(forms, DEFAULT_CONCURRENCY, (form: JiraProformaFormSummary) => this.getProformaForm(issueKey, form.id, includeEmpty));
     }
     async listAttachments(issueKey: string): Promise<JiraAttachmentSummary[]> {
         const issue = await atlassianGet({
@@ -979,7 +1023,7 @@ export class JiraClient {
      * whole batch.
      */
     async getIssuesCycleTime(issueKeys: string[], fromStatus: string, toStatus: string): Promise<JiraIssueCycleTime[]> {
-        return Promise.all(issueKeys.map(async (issueKey: string) => {
+        return mapWithConcurrency(issueKeys, DEFAULT_CONCURRENCY, async (issueKey: string) => {
             try {
                 return await this.getIssueCycleTime(issueKey, fromStatus, toStatus);
             }
@@ -995,7 +1039,7 @@ export class JiraClient {
                     note: message,
                 };
             }
-        }));
+        });
     }
     /**
      * Fetches an issue's Jira "Development" panel data: linked GitHub branches,
@@ -1082,7 +1126,7 @@ export class JiraClient {
      * the whole batch.
      */
     async getIssuesDevStatus(issueKeys: string[]): Promise<JiraIssueDevStatus[]> {
-        return Promise.all(issueKeys.map(async (issueKey: string) => {
+        return mapWithConcurrency(issueKeys, DEFAULT_CONCURRENCY, async (issueKey: string) => {
             try {
                 return await this.getIssueDevStatus(issueKey);
             }
@@ -1090,6 +1134,6 @@ export class JiraClient {
                 const message = error instanceof Error ? error.message : String(error);
                 return { key: issueKey, branches: [], pullRequests: [], commits: [], note: message };
             }
-        }));
+        });
     }
 }

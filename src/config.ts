@@ -2,6 +2,9 @@
  * Loads and validates configuration from environment variables.
  * Fails fast with a clear error message if required variables are missing.
  */
+import { readFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /** Tool groups that can be enabled/disabled to control the tools/list payload. */
 export type ToolGroup = "core" | "forms" | "write" | "files" | "links" | "agile" | "dev";
@@ -26,6 +29,8 @@ const PROFILES: Record<string, ToolGroup[]> = {
 };
 
 export interface AtlassianConfig {
+  /** Path of the .env that was loaded, or null when none was found. */
+  envFile: string | null;
   jiraBaseUrl: string;
   jiraPat: string;
   confluenceBaseUrl: string;
@@ -38,6 +43,58 @@ export interface AtlassianConfig {
   attachmentDirs: string[];
   /** Per-request HTTP timeout in milliseconds. */
   timeoutMs: number;
+}
+
+/**
+ * Minimal .env loader. Keeping secrets in a gitignored .env next to the
+ * install, rather than inline in the MCP client's config, means the client
+ * config can be shared or committed without leaking tokens.
+ *
+ * Values already present in the real environment always win, so a wrapper
+ * script or CI can still override the file.
+ */
+function loadEnvFile(): string | null {
+  const explicit = process.env.ATLASSIAN_ENV_FILE?.trim();
+  const installRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  const candidates = explicit ? [resolve(explicit)] : [join(installRoot, ".env")];
+
+  for (const candidate of candidates) {
+    let contents: string;
+    try {
+      contents = readFileSync(candidate, "utf8");
+    } catch {
+      continue;
+    }
+
+    for (const rawLine of contents.split("\n")) {
+      const line = rawLine.trim();
+      if (line === "" || line.startsWith("#")) continue;
+
+      const separator = line.indexOf("=");
+      if (separator === -1) continue;
+
+      const key = line.slice(0, separator).trim();
+      if (key === "") continue;
+
+      let value = line.slice(separator + 1).trim();
+      // Strip matching surrounding quotes, which people add out of habit and
+      // which would otherwise end up inside the token.
+      if (value.length >= 2 && (value.startsWith('"') || value.startsWith("'"))) {
+        const quote = value[0];
+        if (value.endsWith(quote)) value = value.slice(1, -1);
+      }
+
+      if (process.env[key] === undefined || process.env[key] === "") {
+        process.env[key] = value;
+      }
+    }
+    return candidate;
+  }
+
+  if (explicit) {
+    throw new Error(`ATLASSIAN_ENV_FILE points at "${explicit}", which could not be read.`);
+  }
+  return null;
 }
 
 function requireEnv(name: string): string {
@@ -121,6 +178,8 @@ function parseAttachmentDirs(raw: string | undefined): string[] {
 }
 
 export function loadConfig(): AtlassianConfig {
+  const envFile = loadEnvFile();
+
   const missing: string[] = [];
   const names = ["JIRA_BASE_URL", "JIRA_PAT", "CONFLUENCE_BASE_URL", "CONFLUENCE_PAT"];
   for (const name of names) {
@@ -132,11 +191,15 @@ export function loadConfig(): AtlassianConfig {
   if (missing.length > 0) {
     throw new Error(
       `Missing required environment variable(s): ${missing.join(", ")}. ` +
-        `Copy .env.example to .env and fill in real values, or set them in your MCP client config.`,
+        (envFile
+          ? `Loaded "${envFile}" but it did not define them.`
+          : `No .env file was found next to the install; copy .env.example to .env and fill it in, ` +
+            `or set ATLASSIAN_ENV_FILE to its location.`),
     );
   }
 
   return {
+    envFile,
     jiraBaseUrl: normalizeBaseUrl(requireEnv("JIRA_BASE_URL")),
     jiraPat: requireEnv("JIRA_PAT"),
     confluenceBaseUrl: normalizeBaseUrl(requireEnv("CONFLUENCE_BASE_URL")),

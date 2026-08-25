@@ -17,6 +17,17 @@ export interface ConfluencePageSummary {
     url: string;
 }
 
+/** A page of CQL search results, with enough metadata to detect truncation. */
+export interface ConfluenceSearchResult {
+    start: number;
+    limit: number;
+    returned: number;
+    total: number;
+    hasMore: boolean;
+    nextStart: number | null;
+    pages: ConfluencePageSummary[];
+}
+
 export interface ConfluencePage extends ConfluencePageSummary {
     body: string;
 }
@@ -119,19 +130,33 @@ export class ConfluenceClient {
     constructor(options: ClientOptions) {
         this.options = options;
     }
-    async searchPages(cql: string, limit = 20): Promise<ConfluencePageSummary[]> {
+    async searchPages(cql: string, limit = 20, start = 0): Promise<ConfluenceSearchResult> {
         const data = await atlassianGet({
             baseUrl: this.options.baseUrl,
             pat: this.options.pat,
             path: "/rest/api/content/search",
-            query: { cql, limit },
+            query: { cql, limit, start },
         });
-        return (data.results || []).map((item: any) => ({
+        const pages: ConfluencePageSummary[] = (data.results || []).map((item: any) => ({
             id: item.id,
             title: item.title,
             space: item.space?.key || item.space?.name || "Unknown",
             url: buildPageUrl(this.options.baseUrl, item._links?.webui),
         }));
+        // Confluence reports `totalSize` on search; fall back to what we can
+        // infer so callers always get a usable `hasMore` signal.
+        const total = typeof data.totalSize === "number" ? data.totalSize : start + pages.length;
+        const nextStart = start + pages.length;
+        const hasMore = pages.length > 0 && (Boolean(data._links?.next) || nextStart < total);
+        return {
+            start,
+            limit,
+            returned: pages.length,
+            total,
+            hasMore,
+            nextStart: hasMore ? nextStart : null,
+            pages,
+        };
     }
     async getPage(pageId: string): Promise<ConfluencePage> {
         const page = await atlassianGet({

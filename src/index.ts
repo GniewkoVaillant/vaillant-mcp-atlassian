@@ -96,7 +96,10 @@ async function main() {
     tool("core", "read", "jira_search_issues", {
         title: "Search Jira issues",
         description: "Search Jira Data Center issues using JQL (Jira Query Language). " +
-            "Returns key, summary, status, assignee, issue type, and priority for each matching issue. Read-only.",
+            "Returns key, summary, status, assignee, issue type, and priority for each matching issue, " +
+            "plus pagination metadata: `total` is the full match count, and when `hasMore` is true you " +
+            "must call again with `startAt: nextStartAt` to see the rest — do not treat a truncated " +
+            "page as the complete answer. Read-only.",
         inputSchema: {
             jql: z.string().describe("JQL query string, e.g. 'project = ABC AND status = Open'"),
             maxResults: z
@@ -105,16 +108,22 @@ async function main() {
                 .positive()
                 .max(100)
                 .optional()
-                .describe("Maximum number of results to return (default 20, max 100)"),
+                .describe("Maximum number of results per page (default 20, max 100)"),
+            startAt: z
+                .number()
+                .int()
+                .min(0)
+                .optional()
+                .describe("Zero-based index of the first result to return; pass `nextStartAt` from a previous call"),
         },
-    }, async ({ jql, maxResults }) => {
+    }, async ({ jql, maxResults, startAt }) => {
         try {
-            const results = await jiraClient.searchIssues(jql, maxResults ?? 20);
+            const results = await jiraClient.searchIssues(jql, maxResults ?? 20, startAt ?? 0);
             return {
                 content: [
                     {
                         type: "text",
-                        text: results.length === 0
+                        text: results.total === 0
                             ? "No issues found."
                             : JSON.stringify(results, null, 2),
                     },
@@ -902,11 +911,16 @@ async function main() {
     });
     tool("agile", "read", "jira_get_sprint_report", {
         title: "Get Jira sprint completion/velocity report",
-        description: "Get an approximate velocity/completion report for a single sprint on a Jira Agile board " +
+        description: "Get a velocity/completion report for a single sprint on a Jira Agile board " +
             "(Data Center). Dynamically discovers the board's configured story points field via its " +
             "board configuration, then sums story points for issues in the sprint, split into " +
             "completed (status category 'Done') vs total committed. Also returns an issue count " +
-            "breakdown by status. Read-only.",
+            "breakdown by status. " +
+            "`committedPoints` is the sprint's CURRENT scope, so it silently includes work added " +
+            "mid-sprint. When `scope` is present it comes from Jira's own sprint report: use " +
+            "`scope.initialCommittedPoints` for the real commitment and `scope.addedDuringSprintKeys` " +
+            "to see scope creep. When `scope` is null that breakdown was unavailable — say so rather " +
+            "than presenting `committedPoints` as the commitment. Read-only.",
         inputSchema: {
             boardId: z.number().int().positive().describe("Jira Agile board ID, e.g. 3228"),
             sprintId: z.number().int().positive().describe("Sprint ID to report on"),
@@ -962,7 +976,10 @@ async function main() {
     tool("core", "read", "confluence_search_pages", {
         title: "Search Confluence pages",
         description: "Search Confluence Data Center content using CQL (Confluence Query Language). " +
-            "Returns id, title, space, and URL for each matching page. Read-only.",
+            "Returns id, title, space, and URL for each matching page, plus pagination metadata: " +
+            "`total` is the full match count, and when `hasMore` is true you must call again with " +
+            "`start: nextStart` to see the rest — do not treat a truncated page as the complete " +
+            "answer. Read-only.",
         inputSchema: {
             cql: z
                 .string()
@@ -973,16 +990,22 @@ async function main() {
                 .positive()
                 .max(100)
                 .optional()
-                .describe("Maximum number of results to return (default 20, max 100)"),
+                .describe("Maximum number of results per page (default 20, max 100)"),
+            start: z
+                .number()
+                .int()
+                .min(0)
+                .optional()
+                .describe("Zero-based index of the first result to return; pass `nextStart` from a previous call"),
         },
-    }, async ({ cql, limit }) => {
+    }, async ({ cql, limit, start }) => {
         try {
-            const results = await confluenceClient.searchPages(cql, limit ?? 20);
+            const results = await confluenceClient.searchPages(cql, limit ?? 20, start ?? 0);
             return {
                 content: [
                     {
                         type: "text",
-                        text: results.length === 0
+                        text: results.total === 0
                             ? "No pages found."
                             : JSON.stringify(results, null, 2),
                     },

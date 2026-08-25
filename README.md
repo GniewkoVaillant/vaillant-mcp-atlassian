@@ -22,6 +22,8 @@ npm run build
 npm test               # smoke-test against the real instance
 ```
 
+`.env` is gitignored; only `.env.example` is committed.
+
 ### Registering with GitHub Copilot
 
 Add to `~/.copilot/mcp-config.json`:
@@ -34,13 +36,7 @@ Add to `~/.copilot/mcp-config.json`:
       "command": "node",
       "args": ["/absolute/path/to/dist/index.js"],
       "tools": ["*"],
-      "env": {
-        "JIRA_BASE_URL": "https://jira.example.com",
-        "JIRA_PAT": "...",
-        "CONFLUENCE_BASE_URL": "https://confluence.example.com",
-        "CONFLUENCE_PAT": "...",
-        "ATLASSIAN_PROFILE": "ppm"
-      }
+      "env": {}
     }
   }
 }
@@ -50,7 +46,13 @@ Then restart the Copilot app (not just the session).
 
 `npm run deploy` builds and copies the result into `~/.copilot/mcp-servers/atlassian/dist`, backing up the previous build first.
 
-> **Storing tokens.** Putting PATs directly in `mcp-config.json` leaves them in plaintext on disk. Prefer a wrapper script that reads them from the macOS Keychain or a password manager and `exec`s the server.
+### Where secrets live
+
+The client config holds **no credentials**. On startup the server reads a `.env` sitting next to the install (`<install root>/.env`, i.e. one level above `dist/`), or the path in `ATLASSIAN_ENV_FILE`. Keep that file at mode `600`.
+
+Real environment variables always win over the file, so a wrapper script or CI can override any value.
+
+This keeps tokens out of `mcp-config.json`, which is otherwise easy to share, sync or accidentally commit. The tokens are still plaintext on disk — a Keychain-backed wrapper would be the next step if that matters.
 
 ## Configuration
 
@@ -60,6 +62,7 @@ Then restart the Copilot app (not just the session).
 | `JIRA_PAT` | yes | — | Jira personal access token |
 | `CONFLUENCE_BASE_URL` | yes | — | Confluence DC base URL |
 | `CONFLUENCE_PAT` | yes | — | Confluence personal access token |
+| `ATLASSIAN_ENV_FILE` | no | `<install root>/.env` | Where to read the above from |
 | `ATLASSIAN_READ_ONLY` | no | `false` | Refuse every mutating tool |
 | `ATLASSIAN_PROFILE` | no | `full` | Which tool groups to expose |
 | `ATLASSIAN_ATTACHMENT_DIRS` | no | *(empty)* | Directories attachments may be read from / written to |
@@ -104,23 +107,36 @@ Two settings matter when the agent reads untrusted text — and Jira comments wr
 
 ```
 src/
-  config.ts            env parsing, profiles, read-only, allowlist
+  config.ts            .env loading, profiles, read-only, allowlist
   httpClient.ts        auth, timeouts, retry/backoff, same-origin guard
   jiraClient.ts        issues, fields, ProForma, attachments, links, worklogs
   jiraAgileClient.ts   boards, sprints, velocity
   confluenceClient.ts  pages, comments, storage-format conversion
   proforma.ts          chunked base64 form-design decoding
+  concurrency.ts       bounded parallelism for batch tools
   index.ts             MCP tool registration
 ```
 
 `httpClient.ts` refuses to send credentials to any origin other than the configured base URL, which stops a malicious `content` URL in an API response from exfiltrating the PAT.
 
+## Behaviour worth knowing
+
+**Searches report truncation.** `jira_search_issues` and `confluence_search_pages` return `total`, `hasMore` and a `nextStartAt`/`nextStart` cursor alongside the results. Without that, a capped page is indistinguishable from a complete answer, and conclusions get drawn from partial data.
+
+**Sprint reports separate commitment from scope creep.** `committedPoints` is the sprint's scope *right now*, so it quietly absorbs anything added mid-sprint. When Jira's own sprint report is reachable, `scope.initialCommittedPoints` gives the real commitment and `scope.addedDuringSprintKeys` lists what arrived later. That endpoint is undocumented and restricted on some instances, so `scope` may be `null`; `scopeNote` always says which case you are in.
+
+**Batch tools bound their parallelism.** Tools accepting up to 50 issue keys run 5 requests at a time rather than firing everything at once.
+
+**Field definitions are cached.** Jira's instance-wide field catalogue is fetched at most once every 5 minutes instead of on every `jira_get_issue_fields` call.
+
+**Requests time out and retry.** Every call is bounded by `ATLASSIAN_TIMEOUT_MS`. Rate limiting and transient 5xx are retried with backoff, honouring `Retry-After`. Non-idempotent methods are only replayed on 429, where the request was rejected before being processed.
+
 ## Known limitations
 
-- `jira_get_sprint_report` sums story points **as they are now**, so scope added mid-sprint is invisible. It is not a true commitment figure.
 - `jira_add_worklog_with_category` targets the `vaillant-timetracking` plugin and always creates worklogs with status `TRACKED`. There is no REST endpoint to submit them; that still needs the Jira UI.
-- `jira_search_issues` and `confluence_search_pages` cap at 100 results with no pagination cursor.
 - Confluence storage-format conversion is lossy: tables, macros and link targets are flattened to plain text.
+- `jira_get_issue` returns all comments inline with no paging, so very long-lived issues produce large responses.
+- There is no `list_boards` / `list_projects` tool yet, so board IDs must be known up front.
 
 ## License
 
