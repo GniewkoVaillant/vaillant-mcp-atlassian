@@ -1,0 +1,41 @@
+{
+  "name": "mcp-atlassian",
+  "version": "1.1.0",
+  "description": "MCP server connecting Copilot to on-prem Jira Data Center and Confluence Data Center via Personal Access Tokens, with read and write tools.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "mcp-atlassian": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsc -p tsconfig.json --watch",
+    "inspector": "npx @modelcontextprotocol/inspector node dist/index.js",
+    "deploy": "npm run build && node scripts/deploy.mjs",
+    "test": "npm run build && node scripts/smoke-test.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "jira",
+    "confluence",
+    "atlassian",
+    "copilot"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  }
+}
