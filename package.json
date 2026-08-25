@@ -16,7 +16,9 @@
     "dev": "tsc -p tsconfig.json --watch",
     "inspector": "npx @modelcontextprotocol/inspector node dist/index.js",
     "deploy": "npm run build && node scripts/deploy.mjs",
-    "test": "npm run build && node scripts/smoke-test.mjs"
+    "test:unit": "npm run build && node --test dist/__tests__/*.test.js",
+    "test:smoke": "npm run build && node scripts/smoke-test.mjs",
+    "test": "npm run test:unit && npm run test:smoke"
   },
   "keywords": [
     "mcp",

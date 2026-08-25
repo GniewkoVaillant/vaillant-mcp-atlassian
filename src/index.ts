@@ -50,11 +50,29 @@ async function main() {
         baseUrl: config.confluenceBaseUrl,
         pat: config.confluencePat,
     });
-    const server = new McpServer({
-        name: "mcp-atlassian",
-        version: "1.1.0",
-    });
+    const server = new McpServer(
+        {
+            name: "mcp-atlassian",
+            version: "1.1.0",
+        },
+        {
+            // Declaring the logging capability lets tool invocations show up in
+            // the client's logs. Without it there is no record of which tools
+            // are actually used, and usage can only be inferred.
+            capabilities: { logging: {} },
+        },
+    );
     const registered: string[] = [];
+    /**
+     * Emits an MCP log notification, ignoring failures. Clients that never set
+     * a logging level reject these, and a diagnostic must never break the tool
+     * call it is describing.
+     */
+    function log(level: "debug" | "info" | "error", data: Record<string, unknown>): void {
+        void server.server
+            .sendLoggingMessage({ level, logger: "mcp-atlassian", data })
+            .catch(() => undefined);
+    }
     /**
      * Registers a tool, but only when its group is enabled by the active
      * profile and — for mutating tools — when the server is not in read-only
@@ -75,6 +93,32 @@ async function main() {
     ): void {
         if (!config.enabledGroups.has(group)) return;
         if (config.readOnly && kind !== "read") return;
+        // Wrap the handler so every invocation is observable: duration and
+        // outcome, never arguments — those routinely contain issue content.
+        const instrumented = (async (...args: Parameters<typeof handler>) => {
+            const startedAt = Date.now();
+            log("debug", { event: "tool.start", tool: name, kind });
+            try {
+                const result: any = await (handler as any)(...args);
+                log(result?.isError ? "error" : "info", {
+                    event: "tool.finish",
+                    tool: name,
+                    kind,
+                    ok: !result?.isError,
+                    durationMs: Date.now() - startedAt,
+                });
+                return result;
+            } catch (error) {
+                log("error", {
+                    event: "tool.throw",
+                    tool: name,
+                    kind,
+                    durationMs: Date.now() - startedAt,
+                    message: formatError(error),
+                });
+                throw error;
+            }
+        }) as typeof handler;
         server.registerTool<z.ZodRawShape, InputArgs>(
             name,
             {
@@ -89,10 +133,41 @@ async function main() {
                     openWorldHint: kind !== "local",
                 },
             },
-            handler,
+            instrumented,
         );
         registered.push(name);
     }
+    tool("core", "read", "jira_list_projects", {
+        title: "List Jira projects",
+        description: "List the Jira Data Center projects visible to the current user, with key, name, type " +
+            "and lead. Use this to discover a project key before building a JQL query. Read-only.",
+        inputSchema: {
+            query: z
+                .string()
+                .optional()
+                .describe("Optional case-insensitive filter matched against project key and name"),
+        },
+    }, async ({ query }) => {
+        try {
+            const projects = await jiraClient.listProjects(query);
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: projects.length === 0
+                            ? "No projects found."
+                            : JSON.stringify(projects, null, 2),
+                    },
+                ],
+            };
+        }
+        catch (error) {
+            return {
+                isError: true,
+                content: [{ type: "text", text: `jira_list_projects failed: ${formatError(error)}` }],
+            };
+        }
+    });
     tool("core", "read", "jira_search_issues", {
         title: "Search Jira issues",
         description: "Search Jira Data Center issues using JQL (Jira Query Language). " +
@@ -140,13 +215,22 @@ async function main() {
     tool("core", "read", "jira_get_issue", {
         title: "Get Jira issue",
         description: "Get full details of a single Jira Data Center issue by key, including summary, description, " +
-            "status, assignee, reporter, comments, and created/updated dates. Read-only.",
+            "status, assignee, reporter, comments, and created/updated dates. Only the most recent " +
+            "comments are returned; `commentTotal` is the real count and `commentsTruncated` says " +
+            "whether older ones were held back. Read-only.",
         inputSchema: {
             issueKey: z.string().describe("Jira issue key, e.g. 'ABC-123'"),
+            maxComments: z
+                .number()
+                .int()
+                .min(0)
+                .max(200)
+                .optional()
+                .describe("How many of the most recent comments to include (default 30, 0 for none)"),
         },
-    }, async ({ issueKey }) => {
+    }, async ({ issueKey, maxComments }) => {
         try {
-            const issue = await jiraClient.getIssue(issueKey);
+            const issue = await jiraClient.getIssue(issueKey, maxComments ?? 30);
             return {
                 content: [{ type: "text", text: JSON.stringify(issue, null, 2) }],
             };
@@ -533,6 +617,32 @@ async function main() {
             };
         }
     });
+    tool("write", "write", "jira_assign_issue", {
+        title: "Assign Jira issue",
+        description: "Assign a Jira Data Center issue to a user, or unassign it by passing null. Mutates data: " +
+            "sends a PUT request to the issue's assignee endpoint. Use the account's username (the " +
+            "`name` field), not the display name.",
+        inputSchema: {
+            issueKey: z.string().describe("Jira issue key, e.g. 'ABC-123'"),
+            assignee: z
+                .string()
+                .nullable()
+                .describe("Username to assign to, or null to unassign"),
+        },
+    }, async ({ issueKey, assignee }) => {
+        try {
+            const result = await jiraClient.assignIssue(issueKey, assignee);
+            return {
+                content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+            };
+        }
+        catch (error) {
+            return {
+                isError: true,
+                content: [{ type: "text", text: `jira_assign_issue failed: ${formatError(error)}` }],
+            };
+        }
+    });
     tool("write", "write", "jira_add_comment", {
         title: "Add Jira comment",
         description: "Add a comment to an existing Jira Data Center issue by key. Mutates data: sends a POST " +
@@ -678,21 +788,58 @@ async function main() {
             };
         }
     });
+    tool("write", "read", "jira_get_transitions", {
+        title: "List available Jira transitions",
+        description: "List the transitions currently available on a Jira Data Center issue, including the " +
+            "destination status of each and any fields its transition screen requires (with allowed " +
+            "values where Jira publishes them). Call this before jira_transition_issue when a workflow " +
+            "might demand a resolution or similar field. Read-only.",
+        inputSchema: {
+            issueKey: z.string().describe("Jira issue key, e.g. 'ABC-123'"),
+        },
+    }, async ({ issueKey }) => {
+        try {
+            const transitions = await jiraClient.getTransitions(issueKey);
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: transitions.length === 0
+                            ? `No transitions are available on ${issueKey} for this user.`
+                            : JSON.stringify(transitions, null, 2),
+                    },
+                ],
+            };
+        }
+        catch (error) {
+            return {
+                isError: true,
+                content: [{ type: "text", text: `jira_get_transitions failed: ${formatError(error)}` }],
+            };
+        }
+    });
     tool("write", "write", "jira_transition_issue", {
         title: "Transition Jira issue status",
         description: "Transition a Jira Data Center issue to a new status by name (case-insensitive). Mutates data: " +
             "looks up available transitions, then sends a POST request that changes the real issue's " +
-            "status. Returns an error listing available transition names if the requested status isn't " +
-            "reachable from the issue's current status.",
+            "status. Matches on destination status first, then on transition name. Returns an error " +
+            "listing available transitions if the requested status isn't reachable. If the transition " +
+            "screen requires fields (commonly `resolution`), supply them via `fields` — the error " +
+            "message names the missing fields and their allowed values, and jira_get_transitions shows " +
+            "them up front.",
         inputSchema: {
             issueKey: z.string().describe("Jira issue key, e.g. 'ABC-123'"),
             targetStatus: z
                 .string()
                 .describe("Target status name to transition to, e.g. 'In Progress', 'Done'"),
+            fields: z
+                .record(z.any())
+                .optional()
+                .describe("Fields required by the transition screen, e.g. {\"resolution\":{\"name\":\"Done\"}}"),
         },
-    }, async ({ issueKey, targetStatus }) => {
+    }, async ({ issueKey, targetStatus, fields }) => {
         try {
-            const result = await jiraClient.transitionIssue(issueKey, targetStatus);
+            const result = await jiraClient.transitionIssue(issueKey, targetStatus, fields);
             return {
                 content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
             };
@@ -877,6 +1024,42 @@ async function main() {
             };
         }
     });
+    tool("agile", "read", "jira_list_boards", {
+        title: "List Jira Agile boards",
+        description: "List Jira Agile boards (Data Center) visible to the current user, with id, name, type " +
+            "and owning project. Every board-scoped tool here needs a board ID, so start with this. " +
+            "Read-only.",
+        inputSchema: {
+            name: z
+                .string()
+                .optional()
+                .describe("Optional filter matched against the board name"),
+            projectKeyOrId: z
+                .string()
+                .optional()
+                .describe("Optional project key or id to restrict boards to, e.g. 'ABC'"),
+        },
+    }, async ({ name, projectKeyOrId }) => {
+        try {
+            const boards = await jiraAgileClient.listBoards({ name, projectKeyOrId });
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: boards.length === 0
+                            ? "No boards found."
+                            : JSON.stringify(boards, null, 2),
+                    },
+                ],
+            };
+        }
+        catch (error) {
+            return {
+                isError: true,
+                content: [{ type: "text", text: `jira_list_boards failed: ${formatError(error)}` }],
+            };
+        }
+    });
     tool("agile", "read", "jira_get_board_sprints", {
         title: "List sprints for a Jira board",
         description: "List sprints for a Jira Agile board (Data Center). Returns sprint id, name, state, " +
@@ -1039,6 +1222,100 @@ async function main() {
             return {
                 isError: true,
                 content: [{ type: "text", text: `confluence_get_page failed: ${formatError(error)}` }],
+            };
+        }
+    });
+    tool("core", "read", "confluence_list_spaces", {
+        title: "List Confluence spaces",
+        description: "List the Confluence Data Center spaces visible to the current user, with key, name, " +
+            "type and URL. Use this to discover a space key before writing a CQL query. Read-only.",
+        inputSchema: {
+            limit: z
+                .number()
+                .int()
+                .positive()
+                .max(500)
+                .optional()
+                .describe("Maximum spaces to return (default 100)"),
+        },
+    }, async ({ limit }) => {
+        try {
+            const spaces = await confluenceClient.listSpaces(limit ?? 100);
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: spaces.length === 0 ? "No spaces found." : JSON.stringify(spaces, null, 2),
+                    },
+                ],
+            };
+        }
+        catch (error) {
+            return {
+                isError: true,
+                content: [{ type: "text", text: `confluence_list_spaces failed: ${formatError(error)}` }],
+            };
+        }
+    });
+    tool("core", "read", "confluence_get_page_by_title", {
+        title: "Get Confluence page by title",
+        description: "Get a Confluence Data Center page by its space key and exact title, returning the same " +
+            "content as confluence_get_page. Useful because people refer to pages by title, while page " +
+            "IDs generally only appear in URLs. Read-only.",
+        inputSchema: {
+            spaceKey: z.string().describe("Space key, e.g. 'ENG'"),
+            title: z.string().describe("Exact page title"),
+        },
+    }, async ({ spaceKey, title }) => {
+        try {
+            const page = await confluenceClient.getPageByTitle(spaceKey, title);
+            return {
+                content: [{ type: "text", text: JSON.stringify(page, null, 2) }],
+            };
+        }
+        catch (error) {
+            return {
+                isError: true,
+                content: [
+                    { type: "text", text: `confluence_get_page_by_title failed: ${formatError(error)}` },
+                ],
+            };
+        }
+    });
+    tool("core", "read", "confluence_get_page_children", {
+        title: "List Confluence child pages",
+        description: "List the direct child pages of a Confluence Data Center page, with id, title, space and " +
+            "URL. Use it to walk a documentation tree without guessing at CQL. Read-only.",
+        inputSchema: {
+            pageId: z.string().describe("Confluence page ID, e.g. '601156620'"),
+            limit: z
+                .number()
+                .int()
+                .positive()
+                .max(500)
+                .optional()
+                .describe("Maximum children to return (default 100)"),
+        },
+    }, async ({ pageId, limit }) => {
+        try {
+            const children = await confluenceClient.getPageChildren(pageId, limit ?? 100);
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: children.length === 0
+                            ? "This page has no child pages."
+                            : JSON.stringify(children, null, 2),
+                    },
+                ],
+            };
+        }
+        catch (error) {
+            return {
+                isError: true,
+                content: [
+                    { type: "text", text: `confluence_get_page_children failed: ${formatError(error)}` },
+                ],
             };
         }
     });

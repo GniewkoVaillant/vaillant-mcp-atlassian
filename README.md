@@ -95,12 +95,12 @@ Two settings matter when the agent reads untrusted text — and Jira comments wr
 
 | Group | Tools |
 |---|---|
-| `core` | `jira_search_issues`, `jira_get_issue`, `jira_get_issue_fields`, `confluence_search_pages`, `confluence_get_page`, `confluence_list_comments` |
+| `core` | `jira_list_projects`, `jira_search_issues`, `jira_get_issue`, `jira_get_issue_fields`, `confluence_list_spaces`, `confluence_search_pages`, `confluence_get_page`, `confluence_get_page_by_title`, `confluence_get_page_children`, `confluence_list_comments` |
 | `forms` | `jira_list_proforma_forms`, `jira_get_proforma_form`, `jira_get_proforma_forms_summary` |
-| `write` | `jira_create_issue`, `jira_update_issue`, `jira_add_comment`, `jira_edit_comment`, `jira_delete_comment`, `jira_transition_issue`, `jira_add_worklog`, `jira_add_worklog_with_category`, `confluence_create_page`, `confluence_update_page`, `confluence_add_comment`, `confluence_update_comment`, `confluence_delete_comment` |
+| `write` | `jira_create_issue`, `jira_update_issue`, `jira_assign_issue`, `jira_get_transitions`, `jira_add_comment`, `jira_edit_comment`, `jira_delete_comment`, `jira_transition_issue`, `jira_add_worklog`, `jira_add_worklog_with_category`, `confluence_create_page`, `confluence_update_page`, `confluence_add_comment`, `confluence_update_comment`, `confluence_delete_comment` |
 | `files` | `jira_list_attachments`, `jira_download_attachment`, `jira_upload_attachment`, `jira_delete_attachment` |
 | `links` | `jira_list_issue_link_types`, `jira_get_issue_links`, `jira_create_issue_link`, `jira_delete_issue_link` |
-| `agile` | `jira_get_board_sprints`, `jira_get_sprint_report`, `jira_get_board_velocity`, `jira_get_issues_story_points` |
+| `agile` | `jira_list_boards`, `jira_get_board_sprints`, `jira_get_sprint_report`, `jira_get_board_velocity`, `jira_get_issues_story_points` |
 | `dev` | `jira_get_issue_changelog`, `jira_get_issue_cycle_time`, `jira_get_issue_dev_status`, `jira_get_issues_dev_status` |
 
 ## Architecture
@@ -129,14 +129,17 @@ src/
 
 **Field definitions are cached.** Jira's instance-wide field catalogue is fetched at most once every 5 minutes instead of on every `jira_get_issue_fields` call.
 
+**Transitions explain what they need.** `jira_get_transitions` lists the transitions available on an issue together with the fields each screen requires and their allowed values. `jira_transition_issue` accepts those via `fields`, and when one is missing it names the field and its options instead of surfacing a bare 400.
+
+**Tool invocations are logged.** The server declares the MCP `logging` capability and emits a `tool.start` / `tool.finish` pair per call with duration and outcome. Arguments are never logged — they routinely contain issue content.
+
 **Requests time out and retry.** Every call is bounded by `ATLASSIAN_TIMEOUT_MS`. Rate limiting and transient 5xx are retried with backoff, honouring `Retry-After`. Non-idempotent methods are only replayed on 429, where the request was rejected before being processed.
 
 ## Known limitations
 
 - `jira_add_worklog_with_category` targets the `vaillant-timetracking` plugin and always creates worklogs with status `TRACKED`. There is no REST endpoint to submit them; that still needs the Jira UI.
 - Confluence storage-format conversion is lossy: tables, macros and link targets are flattened to plain text.
-- `jira_get_issue` returns all comments inline with no paging, so very long-lived issues produce large responses.
-- There is no `list_boards` / `list_projects` tool yet, so board IDs must be known up front.
+- `jira_get_issue` returns only the most recent comments; `commentTotal` reports the real number.
 
 ## License
 

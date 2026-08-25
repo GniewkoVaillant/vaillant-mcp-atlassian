@@ -17,6 +17,13 @@ export interface ConfluencePageSummary {
     url: string;
 }
 
+export interface ConfluenceSpaceSummary {
+    key: string;
+    name: string;
+    type: string;
+    url: string;
+}
+
 /** A page of CQL search results, with enough metadata to detect truncation. */
 export interface ConfluenceSearchResult {
     start: number;
@@ -72,15 +79,51 @@ export interface DeleteConfluenceCommentResult {
  * (an XHTML-based format) to plain text. Strips tags and unescapes basic
  * HTML entities. Not a full HTML parser, but good enough for readable output.
  */
-function storageToPlainText(storage: string): string {
-    const withoutTags = storage
+export function storageToPlainText(storage: string): string {
+    let text = storage
+        // Confluence links: keep the target, not just the label. A page whose
+        // links are stripped loses most of its usefulness as a reference.
+        .replace(
+            /<ac:link[^>]*>[\s\S]*?<ri:page[^>]*ri:content-title="([^"]*)"[^>]*\/>[\s\S]*?<\/ac:link>/gi,
+            (_match, title: string) => `[${title}]`,
+        )
+        .replace(
+            /<a[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi,
+            (_match, href: string, label: string) => {
+                const cleanLabel = label.replace(/<[^>]+>/g, "").trim();
+                if (!cleanLabel) return href;
+                return cleanLabel === href ? href : `${cleanLabel} (${href})`;
+            },
+        )
+        // Structured macros carry a name worth keeping as a marker.
+        .replace(
+            /<ac:structured-macro[^>]*ac:name="([^"]*)"[^>]*\/>/gi,
+            (_match, name: string) => `[macro: ${name}]`,
+        )
+        .replace(
+            /<ac:structured-macro[^>]*ac:name="([^"]*)"[^>]*>/gi,
+            (_match, name: string) => `\n[macro: ${name}]\n`,
+        )
+        .replace(/<\/ac:structured-macro>/gi, "\n");
+
+    // Tables become pipe-delimited rows so columns stay aligned with headers
+    // instead of collapsing into one run-on line.
+    text = text
+        .replace(/<\/t[hd]>\s*<t[hd][^>]*>/gi, " | ")
+        .replace(/<t[hd][^>]*>/gi, "| ")
+        .replace(/<\/t[hd]>/gi, " |")
+        .replace(/<\/tr>/gi, "\n")
+        .replace(/<\/table>/gi, "\n\n");
+
+    text = text
         .replace(/<br\s*\/?>/gi, "\n")
         .replace(/<\/p>/gi, "\n\n")
         .replace(/<\/li>/gi, "\n")
         .replace(/<li[^>]*>/gi, "- ")
         .replace(/<\/h[1-6]>/gi, "\n\n")
         .replace(/<[^>]+>/g, "");
-    const unescaped = withoutTags
+
+    const unescaped = text
         .replace(/&nbsp;/g, " ")
         .replace(/&amp;/g, "&")
         .replace(/&lt;/g, "<")
@@ -114,8 +157,22 @@ function escapeHtml(text: string): string {
  * Otherwise, it's escaped and wrapped into `<p>` paragraphs, splitting on
  * blank lines, with single newlines within a paragraph turned into `<br/>`.
  */
+/**
+ * Recognised block/inline tags plus the Confluence-specific `ac:`/`ri:`
+ * namespaces. Matching a real tag name — rather than any `<...>` — stops
+ * ordinary prose like "a < b and c > d" or "use <placeholder> here" from
+ * being mistaken for markup and passed through unescaped, which produces
+ * invalid XHTML and a 400 from Confluence.
+ */
+const HTML_TAG_PATTERN =
+    /<\/?(?:p|br|div|span|h[1-6]|ul|ol|li|table|thead|tbody|tr|t[hd]|a|b|i|u|strong|em|code|pre|blockquote|hr|img|ac:[a-z-]+|ri:[a-z-]+)\b[^>]*>/i;
+
+export function looksLikeStorageMarkup(input: string): boolean {
+    return HTML_TAG_PATTERN.test(input);
+}
+
 function toStorageValue(input: string): string {
-    if (/<[a-z][\s\S]*>/i.test(input)) {
+    if (looksLikeStorageMarkup(input)) {
         return input;
     }
     const paragraphs = input
@@ -173,6 +230,91 @@ export class ConfluenceClient {
             url: buildPageUrl(this.options.baseUrl, page._links?.webui),
             body: storage ? storageToPlainText(storage) : "(no content)",
         };
+    }
+    /**
+     * Lists spaces the PAT's owner can see. Without this, a CQL query has to
+     * guess space keys.
+     */
+    async listSpaces(limit = 100): Promise<ConfluenceSpaceSummary[]> {
+        const spaces: any[] = [];
+        let start = 0;
+        while (spaces.length < limit) {
+            const pageSize = Math.min(100, limit - spaces.length);
+            const response = await atlassianGet({
+                baseUrl: this.options.baseUrl,
+                pat: this.options.pat,
+                path: "/rest/api/space",
+                query: { start, limit: pageSize },
+            });
+            const results = response.results || [];
+            spaces.push(...results);
+            if (results.length < pageSize) break;
+            start += results.length;
+        }
+        return spaces.slice(0, limit).map((space) => ({
+            key: space.key,
+            name: space.name || "",
+            type: space.type || "",
+            url: buildPageUrl(this.options.baseUrl, space._links?.webui),
+        }));
+    }
+    /**
+     * Resolves a page by space key and exact title, which is how people
+     * actually refer to Confluence pages — page IDs rarely appear outside
+     * URLs.
+     */
+    async getPageByTitle(spaceKey: string, title: string): Promise<ConfluencePage> {
+        const response = await atlassianGet({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: "/rest/api/content",
+            query: {
+                spaceKey,
+                title,
+                type: "page",
+                expand: "body.storage,space",
+                limit: 1,
+            },
+        });
+        const page = (response.results || [])[0];
+        if (!page) {
+            throw new Error(`No page titled "${title}" was found in space ${spaceKey}.`);
+        }
+        const storage = page.body?.storage?.value || "";
+        return {
+            id: page.id,
+            title: page.title,
+            space: page.space?.key || page.space?.name || spaceKey,
+            url: buildPageUrl(this.options.baseUrl, page._links?.webui),
+            body: storage ? storageToPlainText(storage) : "(no content)",
+        };
+    }
+    /**
+     * Lists the direct child pages of a page, so a documentation tree can be
+     * walked without guessing at CQL.
+     */
+    async getPageChildren(pageId: string, limit = 100): Promise<ConfluencePageSummary[]> {
+        const children: any[] = [];
+        let start = 0;
+        while (children.length < limit) {
+            const pageSize = Math.min(100, limit - children.length);
+            const response = await atlassianGet({
+                baseUrl: this.options.baseUrl,
+                pat: this.options.pat,
+                path: `/rest/api/content/${encodeURIComponent(pageId)}/child/page`,
+                query: { start, limit: pageSize, expand: "space" },
+            });
+            const results = response.results || [];
+            children.push(...results);
+            if (results.length < pageSize) break;
+            start += results.length;
+        }
+        return children.slice(0, limit).map((child) => ({
+            id: child.id,
+            title: child.title,
+            space: child.space?.key || child.space?.name || "Unknown",
+            url: buildPageUrl(this.options.baseUrl, child._links?.webui),
+        }));
     }
     /**
      * Creates a new Confluence page. `body` may be plain text or simple HTML;

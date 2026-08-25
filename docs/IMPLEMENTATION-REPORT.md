@@ -124,6 +124,26 @@ The deployed `.env` is mode `600`. Tokens remain plaintext on disk — a Keychai
 
 **Velocity fixes.** The sprint list and estimation field are fetched once and passed down, instead of being refetched per sprint. Closed sprints are now sorted by end date rather than trusting API ordering.
 
+### 4.4 Discovery tools, transitions, observability, tests (commit pending)
+
+**Discovery gap closed.** Three tools required a board ID and nothing could produce one; a project key or space key had to be known before any query could be written. Added `jira_list_projects`, `jira_list_boards`, `confluence_list_spaces`, `confluence_get_page_by_title` (people cite pages by title, not ID) and `confluence_get_page_children` (walk a doc tree without guessing CQL).
+
+**Transitions that explain themselves.** `jira_transition_issue` previously sent only a transition ID, so any workflow whose screen required a field — most commonly `resolution` — failed with a raw 400. It now accepts `fields`, and pre-checks the transition's required fields to fail with a message naming each missing field and its allowed values. `jira_get_transitions` exposes the same metadata up front. Matching also changed: destination status is tried first, then transition name, since a transition is often named differently from the status it leads to.
+
+**Assignment.** `jira_assign_issue` added; reassignment previously meant hand-crafting an `update_issue` payload.
+
+**Comment flooding.** `jira_get_issue` returned every comment inline. It now returns the most recent 30 by default and reports `commentTotal` and `commentsTruncated`, so bounding the response does not quietly hide the tail.
+
+**Storage-format fidelity.** `storageToPlainText` flattened tables into run-on lines and discarded link targets, which made a Confluence decision table close to useless as a reference. Tables are now pipe-delimited per row, anchors render as `Label (url)`, `<ac:link>` page references become `[Title]`, and macros leave a `[macro: name]` marker.
+
+`toStorageValue` decided "is this already markup?" with `/<[a-z][\s\S]*>/i`, which matches ordinary prose like `a < b and c > d`. Such text was passed through unescaped, producing invalid XHTML and a 400 on write. The check now requires a recognised tag name (including the `ac:`/`ri:` namespaces).
+
+**Observability.** The server now declares the MCP `logging` capability and wraps every handler to emit `tool.start` / `tool.finish` with duration and outcome. Arguments are deliberately never logged — they routinely carry issue content. This was the gap that made the earlier usage analysis guesswork.
+
+**Unit tests.** 43 tests using `node:test`, covering the logic where a regression would be quietest: ProForma chunk reassembly (including out-of-order chunks and every error path), cycle-time computation (including the reopen case, where the span must run from first start to last finish), storage-format conversion, `mapWithConcurrency` ordering and cap, and config/profile parsing. Cycle-time logic was extracted into a pure `computeCycleTime` so it could be tested without a Jira instance.
+
+The regression tests that matter most are the two prose strings the old HTML heuristic misclassified.
+
 ---
 
 ## 5. Measured results
@@ -132,15 +152,19 @@ The deployed `.env` is mode `600`. Tokens remain plaintext on disk — a Keychai
 
 | Profile | Tools | Payload | Tokens |
 |---|---:|---:|---:|
-| **Before (no profiles)** | 38 | 27 215 B | ~6 800 |
-| `full` | 38 | 32 232 B | ~8 058 |
-| `ppm` *(deployed)* | 30 | 24 403 B | ~6 101 |
-| `read` | 21 | 17 692 B | ~4 423 |
-| `agile` | 14 | 12 927 B | ~3 232 |
-| `core` | 6 | 5 098 B | ~1 275 |
-| `full` + read-only | 20 | 16 795 B | ~4 199 |
+| **Before (no profiles, 38 tools)** | 38 | 27 215 B | ~6 800 |
+| `full` | 45 | 37 949 B | ~9 487 |
+| `ppm` *(deployed)* | 36 | 29 388 B | ~7 347 |
+| `core,forms,write` | 28 | 24 290 B | ~6 073 |
+| `read` | 26 | 21 480 B | ~5 370 |
+| `full` + read-only | 26 | 21 360 B | ~5 340 |
+| `agile` | 19 | 16 715 B | ~4 179 |
+| `core,forms` | 13 | 10 437 B | ~2 609 |
+| `core` | 10 | 8 154 B | ~2 039 |
 
-Annotations added ~1 250 tokens to the full surface. Profiles more than repay it: the deployed `ppm` profile is below the original baseline while carrying strictly more metadata, and `agile` or `core` cut the cost by 2.5–5×.
+Seven new tools and richer descriptions pushed the full surface past the original baseline, which is the honest trade: more capability costs more context. Profiles are what make that affordable — the same server can present 2k or 9.5k tokens depending on the job.
+
+**A note on the deployed profile.** `ppm` now costs ~7 347 tokens, above the original 6 800 baseline. `core,forms,write` would cover the workflow actually exercised so far (search, issue detail, custom fields, ProForma, commenting, Confluence read) at ~6 073, dropping only attachments and issue links. Those were added deliberately for PPM audits, so they were left enabled rather than quietly removed — but switching is a one-line change in `.env`.
 
 ### Other
 
@@ -153,7 +177,11 @@ Annotations added ~1 250 tokens to the full surface. Profiles more than repay it
 | Field catalogue fetches | 1 per call | 1 per 5 min |
 | Velocity round-trips (5 sprints) | ~10 redundant | 0 redundant |
 | Secrets in client config | 2 PATs | none |
-| TypeScript sources | none | 3 758 lines, `strict`, 0 errors |
+| Tools | 38 | 45 |
+| Unit tests | 0 | 43 |
+| MCP capabilities | tools | tools + logging |
+| Comments per issue response | all | 30 most recent, count reported |
+| TypeScript sources | none | `strict`, 0 errors |
 
 ---
 
@@ -184,14 +212,16 @@ Annotations added ~1 250 tokens to the full surface. Profiles more than repay it
 
 **Security.** Tokens are plaintext in `.env` (mode 600). A Keychain-backed wrapper script would remove that.
 
-**Missing tools.** There is no `list_boards` or `list_projects`, yet three tools require a board ID — it has to be known up front. Also absent: `get_transitions` (preview before transitioning), `assign_issue`, `list_spaces`, `get_page_by_title`, `get_page_children`.
+**Missing tools.** No bulk operations (`bulk_update`), no worklog listing or deletion, no watcher management, no Confluence attachment or page-history access, no `delete_page`.
 
 **Known weak spots.**
-- `jira_transition_issue` cannot supply fields required by a transition screen, so any workflow demanding `resolution` fails.
-- `toStorageValue` decides "is this HTML?" with a loose regex; plain text containing `<` or `>` can slip through unescaped.
-- `storageToPlainText` flattens tables, macros and link targets.
-- `jira_get_issue` returns all comments inline with no paging.
+- `jira_add_worklog_with_category` cannot move a worklog from `TRACKED` to `SUBMITTED`; the plugin exposes no REST endpoint for it.
+- `storageToPlainText` is regex-based. It now preserves links, tables and macro names, but it is not a parser and will mishandle deeply nested or unusual markup.
+- Sprint scope depends on the undocumented greenhopper endpoint. Where it is blocked, only current scope is available — reported explicitly, but still a gap.
+- `jira_get_issue_fields` with no `fieldNames` still fetches every non-bulky field on the issue, which can be a large response on PPM tickets.
 
-**Observability.** The server does not declare the MCP `logging` capability, so tool invocations leave no trace in client logs. Adding it would make usage measurable rather than inferred.
+**Dead code.** Writing the ProForma tests surfaced that the "Missing chunk N/M" branch in `decodeProformaDesign` is unreachable: a gap in the chunk set is always caught earlier by the incomplete-set check. Harmless, but it is not the safety net it appears to be.
 
-**Tests.** The smoke test covers startup, surface and connectivity. There are no unit tests for the trickier pure logic — ProForma chunk reassembly, cycle-time computation, storage-format conversion — which is where regressions would be quietest.
+**Testing.** 43 unit tests cover the pure logic and the smoke test covers startup, surface and connectivity. Untested: the HTTP layer's retry and timeout behaviour, which would need a stub server, and every client method that talks to Jira or Confluence.
+
+**Security.** Tokens are plaintext in `.env` (mode 600) — see above.

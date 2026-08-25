@@ -36,7 +36,12 @@ if (existsSync(targetDist)) {
   console.log(`Previous build moved to ${backup}`);
 }
 
-await cp(sourceDist, targetDist, { recursive: true });
+// Compiled tests live in dist/__tests__ but have no business running inside
+// the deployed server.
+await cp(sourceDist, targetDist, {
+  recursive: true,
+  filter: (source) => !source.includes("__tests__"),
+});
 
 // The server is launched directly by Copilot, so node_modules must resolve
 // from the deployed location too.

@@ -12,6 +12,14 @@ export interface ClientOptions {
     pat: string;
 }
 
+export interface JiraBoardSummary {
+    id: number;
+    name: string;
+    type: string;
+    projectKey: string;
+    projectName: string;
+}
+
 export interface JiraSprintSummary {
     id: number;
     name: string;
@@ -107,6 +115,43 @@ export class JiraAgileClient {
     private readonly options: ClientOptions;
     constructor(options: ClientOptions) {
         this.options = options;
+    }
+    /**
+     * Lists boards visible to the PAT's owner, optionally filtered by name or
+     * project. Three tools here take a board ID, and before this there was no
+     * way to discover one from inside the agent.
+     */
+    async listBoards(options: { name?: string; projectKeyOrId?: string } = {}): Promise<JiraBoardSummary[]> {
+        const boards: any[] = [];
+        let startAt = 0;
+        const maxResults = 50;
+        for (;;) {
+            const page = await atlassianGet({
+                baseUrl: this.options.baseUrl,
+                pat: this.options.pat,
+                path: "/rest/agile/1.0/board",
+                query: {
+                    startAt,
+                    maxResults,
+                    name: options.name,
+                    projectKeyOrId: options.projectKeyOrId,
+                },
+            });
+            const values = page.values || [];
+            boards.push(...values);
+            const gotAll = page.isLast === true ||
+                values.length === 0 ||
+                (page.total !== undefined && boards.length >= page.total);
+            if (gotAll) break;
+            startAt += values.length;
+        }
+        return boards.map((board) => ({
+            id: board.id,
+            name: board.name || "",
+            type: board.type || "",
+            projectKey: board.location?.projectKey || "",
+            projectName: board.location?.projectName || "",
+        }));
     }
     /**
      * Lists sprints for a board, paginating through `startAt` as needed.

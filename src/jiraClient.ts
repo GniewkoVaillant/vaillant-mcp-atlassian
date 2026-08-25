@@ -65,7 +65,38 @@ export interface JiraIssueDetails {
     reporter: string;
     created: string;
     updated: string;
+    /** Total comments on the issue, before any truncation. */
+    commentTotal: number;
+    /** True when older comments were omitted to bound the response size. */
+    commentsTruncated: boolean;
     comments: JiraCommentSummary[];
+}
+
+export interface JiraProjectSummary {
+    id: string;
+    key: string;
+    name: string;
+    projectTypeKey: string;
+    lead: string;
+}
+
+export interface JiraTransitionRequiredField {
+    id: string;
+    name: string;
+    allowedValues: string[];
+}
+
+/** A transition available on an issue, plus what its screen demands. */
+export interface JiraTransitionOption {
+    id: string;
+    name: string;
+    toStatus: string;
+    requiredFields: JiraTransitionRequiredField[];
+}
+
+export interface JiraAssignResult {
+    issueKey: string;
+    assignee: string | null;
 }
 
 export interface JiraIssueFieldValue {
@@ -317,6 +348,51 @@ function collectStatusTransitions(histories: any[], out: JiraStatusTransition[])
         }
     }
 }
+/**
+ * Computes cycle time from a status-transition history.
+ *
+ * Takes the FIRST entry into `fromStatus` and the LAST entry into `toStatus`,
+ * which is what you want when an issue is reopened and redone: the work spans
+ * from when it first started to when it was finally finished.
+ *
+ * Split out from the client so it can be tested without a Jira instance.
+ */
+export function computeCycleTime(
+    issueKey: string,
+    transitions: JiraStatusTransition[],
+    fromStatus: string,
+    toStatus: string,
+): JiraIssueCycleTime {
+    const normalizedFrom = fromStatus.toLowerCase();
+    const normalizedTo = toStatus.toLowerCase();
+    const fromTransition = transitions.find((t) => t.to.toLowerCase() === normalizedFrom);
+    const toTransitions = transitions.filter((t) => t.to.toLowerCase() === normalizedTo);
+    const toTransition = toTransitions.length > 0 ? toTransitions[toTransitions.length - 1] : undefined;
+    if (!fromTransition || !toTransition) {
+        const missing = !fromTransition ? fromStatus : toStatus;
+        return {
+            key: issueKey,
+            fromStatus,
+            toStatus,
+            fromStatusEnteredAt: fromTransition?.at || null,
+            toStatusEnteredAt: toTransition?.at || null,
+            cycleTimeDays: null,
+            note: `Issue never transitioned to "${missing}".`,
+        };
+    }
+    const fromMs = new Date(fromTransition.at).getTime();
+    const toMs = new Date(toTransition.at).getTime();
+    const cycleTimeDays = Math.round(((toMs - fromMs) / 86400000) * 10) / 10;
+    return {
+        key: issueKey,
+        fromStatus,
+        toStatus,
+        fromStatusEnteredAt: fromTransition.at,
+        toStatusEnteredAt: toTransition.at,
+        cycleTimeDays,
+    };
+}
+
 export class JiraClient {
     private readonly options: ClientOptions;
     /**
@@ -439,7 +515,7 @@ export class JiraClient {
             };
         });
     }
-    async getIssue(issueKey: string): Promise<JiraIssueDetails> {
+    async getIssue(issueKey: string, maxComments = 30): Promise<JiraIssueDetails> {
         const issue = await atlassianGet({
             baseUrl: this.options.baseUrl,
             pat: this.options.pat,
@@ -448,7 +524,14 @@ export class JiraClient {
                 fields: "summary,description,status,assignee,reporter,created,updated,comment",
             },
         });
-        const comments = (issue.fields.comment?.comments || []).map((c: any) => ({
+        const allComments = issue.fields.comment?.comments || [];
+        // Long-lived issues can carry hundreds of comments. Return the most
+        // recent ones and say how many were held back, rather than flooding
+        // the context or silently pretending the tail does not exist.
+        const kept = maxComments >= 0 && allComments.length > maxComments
+            ? allComments.slice(-maxComments)
+            : allComments;
+        const comments = kept.map((c: any) => ({
             author: userLabel(c.author),
             body: c.body || "",
             created: c.created || "",
@@ -462,8 +545,80 @@ export class JiraClient {
             reporter: userLabel(issue.fields.reporter),
             created: issue.fields.created || "",
             updated: issue.fields.updated || "",
+            commentTotal: allComments.length,
+            commentsTruncated: allComments.length > comments.length,
             comments,
         };
+    }
+    /**
+     * Lists the projects the PAT's owner can see. Without this there is no way
+     * to discover a project key from inside the agent — it has to be known
+     * up front.
+     */
+    async listProjects(query?: string): Promise<JiraProjectSummary[]> {
+        const projects = await atlassianGet({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: "/rest/api/2/project",
+        });
+        const normalized = query?.trim().toLowerCase();
+        return (projects || [])
+            .map((project: any) => ({
+                id: project.id,
+                key: project.key,
+                name: project.name || "",
+                projectTypeKey: project.projectTypeKey || "",
+                lead: project.lead?.displayName || project.lead?.name || "",
+            }))
+            .filter((project: JiraProjectSummary) =>
+                !normalized ||
+                project.key.toLowerCase().includes(normalized) ||
+                project.name.toLowerCase().includes(normalized));
+    }
+    /**
+     * Lists the transitions currently available on an issue, including which
+     * fields each transition screen requires. Calling this before
+     * transitionIssue is the difference between a clean transition and a
+     * "Field 'resolution' is required" failure.
+     */
+    async getTransitions(issueKey: string): Promise<JiraTransitionOption[]> {
+        const { transitions } = await atlassianGet({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/2/issue/${encodeURIComponent(issueKey)}/transitions`,
+            query: { expand: "transitions.fields" },
+        });
+        return (transitions || []).map((transition: any) => {
+            const fields = transition.fields || {};
+            return {
+                id: transition.id,
+                name: transition.name || "",
+                toStatus: transition.to?.name || "",
+                requiredFields: Object.entries(fields)
+                    .filter(([, meta]: [string, any]) => meta?.required === true)
+                    .map(([fieldId, meta]: [string, any]) => ({
+                        id: fieldId,
+                        name: meta?.name || fieldId,
+                        allowedValues: Array.isArray(meta?.allowedValues)
+                            ? meta.allowedValues
+                                .map((value: any) => value?.name || value?.value || value?.id)
+                                .filter((value: any) => typeof value === "string")
+                            : [],
+                    })),
+            };
+        });
+    }
+    /**
+     * Assigns an issue to a user, or unassigns it when `assignee` is null.
+     */
+    async assignIssue(issueKey: string, assignee: string | null): Promise<JiraAssignResult> {
+        await atlassianPut({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/2/issue/${encodeURIComponent(issueKey)}/assignee`,
+            body: { name: assignee },
+        });
+        return { issueKey, assignee };
     }
     async getIssueFields(issueKey: string, fieldNames: string[] = [], includeEmpty = false): Promise<JiraIssueFieldValue[]> {
         const definitions = await this.getFieldDefinitions();
@@ -891,27 +1046,70 @@ export class JiraClient {
      * /rest/api/2/issue/{issueKey}/transitions to discover the transition id,
      * then POST the chosen transition.
      */
-    async transitionIssue(issueKey: string, targetStatusName: string): Promise<JiraTransitionResult> {
+    async transitionIssue(
+        issueKey: string,
+        targetStatusName: string,
+        extraFields?: Record<string, unknown>,
+    ): Promise<JiraTransitionResult> {
         const { transitions } = await atlassianGet({
             baseUrl: this.options.baseUrl,
             pat: this.options.pat,
             path: `/rest/api/2/issue/${encodeURIComponent(issueKey)}/transitions`,
+            query: { expand: "transitions.fields" },
         });
         const normalizedTarget = targetStatusName.trim().toLowerCase();
-        const match = (transitions || []).find((t: any) => {
-            const name = (t.to?.name || t.name || "").toLowerCase();
-            return name === normalizedTarget;
-        });
+        const available = transitions || [];
+        // Prefer the destination status, then the transition's own name. Doing
+        // it in that order matters when a transition is named differently from
+        // the status it leads to ("Start Progress" -> "In Progress").
+        const match =
+            available.find((t: any) => (t.to?.name || "").toLowerCase() === normalizedTarget) ??
+            available.find((t: any) => (t.name || "").toLowerCase() === normalizedTarget);
         if (!match) {
-            const available = (transitions || []).map((t: any) => t.to?.name || t.name).join(", ") || "(none)";
+            const options = available
+                .map((t: any) => `"${t.name}" -> "${t.to?.name || "?"}"`)
+                .join(", ") || "(none)";
             throw new Error(`No transition to status "${targetStatusName}" is available for ${issueKey}. ` +
-                `Available transitions: ${available}`);
+                `Available transitions: ${options}`);
         }
+
+        const fields: Record<string, unknown> = { ...(extraFields || {}) };
+
+        // Transition screens frequently mark resolution as required, and Jira
+        // rejects the whole transition if it is missing. Surface that as a
+        // precise, actionable error instead of a raw 400.
+        const requiredFieldIds = Object.entries(match.fields || {})
+            .filter(([, meta]: [string, any]) => meta?.required === true)
+            .map(([fieldId]) => fieldId);
+        const missing = requiredFieldIds.filter((fieldId) => !(fieldId in fields));
+        if (missing.length > 0) {
+            const detail = missing
+                .map((fieldId) => {
+                    const meta: any = match.fields[fieldId];
+                    const allowed = Array.isArray(meta?.allowedValues)
+                        ? meta.allowedValues
+                            .map((value: any) => value?.name || value?.value || value?.id)
+                            .filter((value: any) => typeof value === "string")
+                        : [];
+                    const name = meta?.name || fieldId;
+                    return allowed.length > 0
+                        ? `${fieldId} (${name}; one of: ${allowed.join(", ")})`
+                        : `${fieldId} (${name})`;
+                })
+                .join(", ");
+            throw new Error(
+                `Transition "${match.name}" on ${issueKey} requires field(s) that were not supplied: ${detail}. ` +
+                    `Pass them via the "fields" argument, e.g. {"resolution":{"name":"Done"}}.`,
+            );
+        }
+
         await atlassianPost({
             baseUrl: this.options.baseUrl,
             pat: this.options.pat,
             path: `/rest/api/2/issue/${encodeURIComponent(issueKey)}/transitions`,
-            body: { transition: { id: match.id } },
+            body: Object.keys(fields).length > 0
+                ? { transition: { id: match.id }, fields }
+                : { transition: { id: match.id } },
         });
         return { issueKey, transitionedTo: match.to?.name || match.name };
     }
@@ -987,34 +1185,7 @@ export class JiraClient {
      */
     async getIssueCycleTime(issueKey: string, fromStatus: string, toStatus: string): Promise<JiraIssueCycleTime> {
         const { transitions } = await this.getIssueChangelog(issueKey);
-        const normalizedFrom = fromStatus.toLowerCase();
-        const normalizedTo = toStatus.toLowerCase();
-        const fromTransition = transitions.find((t) => t.to.toLowerCase() === normalizedFrom);
-        const toTransitions = transitions.filter((t) => t.to.toLowerCase() === normalizedTo);
-        const toTransition = toTransitions.length > 0 ? toTransitions[toTransitions.length - 1] : undefined;
-        if (!fromTransition || !toTransition) {
-            const missing = !fromTransition ? fromStatus : toStatus;
-            return {
-                key: issueKey,
-                fromStatus,
-                toStatus,
-                fromStatusEnteredAt: fromTransition?.at || null,
-                toStatusEnteredAt: toTransition?.at || null,
-                cycleTimeDays: null,
-                note: `Issue never transitioned to "${missing}".`,
-            };
-        }
-        const fromMs = new Date(fromTransition.at).getTime();
-        const toMs = new Date(toTransition.at).getTime();
-        const cycleTimeDays = Math.round(((toMs - fromMs) / 86400000) * 10) / 10;
-        return {
-            key: issueKey,
-            fromStatus,
-            toStatus,
-            fromStatusEnteredAt: fromTransition.at,
-            toStatusEnteredAt: toTransition.at,
-            cycleTimeDays,
-        };
+        return computeCycleTime(issueKey, transitions, fromStatus, toStatus);
     }
     /**
      * Batch-friendly wrapper for computing cycle time across many issues in
