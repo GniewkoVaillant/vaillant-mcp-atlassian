@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { rmSync, writeFileSync } from "node:fs";
+import { chmodSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { loadConfig, type ToolGroup } from "../config.js";
 
@@ -15,7 +15,8 @@ function restoreEnv(): void {
 }
 
 function writeEnv(contents: string): void {
-  writeFileSync(ENV_FILE, contents, "utf8");
+  writeFileSync(ENV_FILE, contents, { encoding: "utf8", mode: 0o600 });
+  chmodSync(ENV_FILE, 0o600);
   process.env.ATLASSIAN_ENV_FILE = ENV_FILE;
 }
 
@@ -80,6 +81,31 @@ ATLASSIAN_TIMEOUT_MS=45000
     assert.equal(config.confluencePat, "confluence-from-file");
     assert.equal(config.timeoutMs, 45000);
   });
+
+  test("refuses an environment file readable by other users", { skip: process.platform === "win32" }, () => {
+    setRequiredEnv();
+    chmodSync(ENV_FILE, 0o644);
+
+    assert.throws(() => loadConfig(), /accessible to other users.*chmod 600/);
+  });
+
+  test("requires HTTPS except for loopback development servers", () => {
+    setRequiredEnv();
+    process.env.JIRA_BASE_URL = "http://jira.example.test";
+    assert.throws(() => loadConfig(), /JIRA_BASE_URL must use HTTPS/);
+
+    process.env.JIRA_BASE_URL = "http://127.0.0.1:7010";
+    assert.equal(loadConfig().jiraBaseUrl, "http://127.0.0.1:7010");
+  });
+
+  test("rejects base URLs with embedded credentials, queries or fragments", () => {
+    setRequiredEnv();
+    process.env.JIRA_BASE_URL = "https://user:password@jira.example.test";
+    assert.throws(() => loadConfig(), /must not contain embedded credentials/);
+
+    process.env.JIRA_BASE_URL = "https://jira.example.test/?unexpected=true";
+    assert.throws(() => loadConfig(), /must not contain a query string or fragment/);
+  });
 });
 
 describe("loadConfig profile parsing", () => {
@@ -103,6 +129,14 @@ describe("loadConfig profile parsing", () => {
 
     assert.throws(() => loadConfig(), /Unknown tool group "nope" in ATLASSIAN_PROFILE/);
   });
+
+  test("the read profile enforces read-only mode even if its flag is explicitly false", () => {
+    setRequiredEnv();
+    process.env.ATLASSIAN_PROFILE = "read";
+    process.env.ATLASSIAN_READ_ONLY = "false";
+
+    assert.equal(loadConfig().readOnly, true);
+  });
 });
 
 describe("loadConfig scalar parsing", () => {
@@ -120,6 +154,14 @@ describe("loadConfig scalar parsing", () => {
     process.env.ATLASSIAN_READ_ONLY = "maybe";
 
     assert.throws(() => loadConfig(), /Invalid boolean value "maybe"\. Use true\/false\./);
+  });
+
+  test("destructive operations are disabled unless explicitly enabled", () => {
+    setRequiredEnv();
+    assert.equal(loadConfig().allowDestructive, false);
+
+    process.env.ATLASSIAN_ALLOW_DESTRUCTIVE = "true";
+    assert.equal(loadConfig().allowDestructive, true);
   });
 
   test("ATLASSIAN_TIMEOUT_MS defaults to 30000 and accepts a positive number", () => {
@@ -146,5 +188,50 @@ describe("loadConfig scalar parsing", () => {
 
     process.env.ATLASSIAN_ATTACHMENT_DIRS = " /one :/two:: /three ";
     assert.deepEqual(loadConfig().attachmentDirs, ["/one", "/two", "/three"]);
+  });
+
+  test("attachment allowlists reject relative directories and the filesystem root", () => {
+    setRequiredEnv();
+    process.env.ATLASSIAN_ATTACHMENT_DIRS = "relative/path";
+    assert.throws(() => loadConfig(), /Use an absolute directory other than the filesystem root/);
+
+    process.env.ATLASSIAN_ATTACHMENT_DIRS = "/";
+    assert.throws(() => loadConfig(), /Use an absolute directory other than the filesystem root/);
+  });
+
+  test("resource protection defaults are bounded and configurable", () => {
+    setRequiredEnv();
+    const defaults = loadConfig();
+    assert.equal(defaults.totalTimeoutMs, 45_000);
+    assert.equal(defaults.maxConcurrentRequests, 4);
+    assert.equal(defaults.maxQueuedRequests, 16);
+    assert.equal(defaults.maxAttachmentBytes, 10 * 1024 * 1024);
+    assert.equal(defaults.maxPaginationPages, 10);
+
+    process.env.ATLASSIAN_TOTAL_TIMEOUT_MS = "12000";
+    process.env.ATLASSIAN_MAX_CONCURRENT_REQUESTS = "2";
+    process.env.ATLASSIAN_MAX_QUEUED_REQUESTS = "0";
+    process.env.ATLASSIAN_MAX_ATTACHMENT_BYTES = "4096";
+    process.env.ATLASSIAN_MAX_PAGINATION_PAGES = "3";
+    const configured = loadConfig();
+    assert.equal(configured.totalTimeoutMs, 12_000);
+    assert.equal(configured.maxConcurrentRequests, 2);
+    assert.equal(configured.maxQueuedRequests, 0);
+    assert.equal(configured.maxAttachmentBytes, 4096);
+    assert.equal(configured.maxPaginationPages, 3);
+  });
+
+  test("resource limits reject fractional, negative and excessive values", () => {
+    setRequiredEnv();
+    process.env.ATLASSIAN_MAX_CONCURRENT_REQUESTS = "1.5";
+    assert.throws(() => loadConfig(), /Invalid ATLASSIAN_MAX_CONCURRENT_REQUESTS/);
+
+    delete process.env.ATLASSIAN_MAX_CONCURRENT_REQUESTS;
+    process.env.ATLASSIAN_MAX_QUEUED_REQUESTS = "-1";
+    assert.throws(() => loadConfig(), /Invalid ATLASSIAN_MAX_QUEUED_REQUESTS/);
+
+    delete process.env.ATLASSIAN_MAX_QUEUED_REQUESTS;
+    process.env.ATLASSIAN_MAX_PAGINATION_PAGES = "101";
+    assert.throws(() => loadConfig(), /Invalid ATLASSIAN_MAX_PAGINATION_PAGES/);
   });
 });

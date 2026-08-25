@@ -3,11 +3,58 @@
  * Personal Access Token. Supports both read-only lookups and write
  * (mutating) operations such as creating and updating pages.
  */
-import { atlassianDelete, atlassianGet, atlassianPost, atlassianPut } from "./httpClient.js";
+import {
+    assertAttachmentPathAllowed,
+    assertAttachmentSize,
+    DEFAULT_MAX_ATTACHMENT_BYTES,
+    writeNewAttachment,
+} from "./attachmentSecurity.js";
+import {
+    atlassianDelete,
+    atlassianGet,
+    atlassianGetBinary,
+    atlassianPost,
+    atlassianPut,
+} from "./httpClient.js";
 
 export interface ClientOptions {
     baseUrl: string;
     pat: string;
+    /** Absolute directories attachment downloads may write to. Empty disables them. */
+    attachmentDirs?: string[];
+    /** Maximum number of bytes accepted for attachment downloads. */
+    maxAttachmentBytes?: number;
+}
+
+export interface ConfluenceAttachment {
+    id: string;
+    title: string;
+    mediaType: string;
+    fileSize: number;
+    author: string;
+    created: string;
+    downloadPath: string;
+}
+
+export interface ConfluenceAttachmentDownload {
+    id: string;
+    title: string;
+    outputPath: string;
+    bytesWritten: number;
+    contentType: string;
+}
+
+export interface ConfluencePageVersion {
+    number: number;
+    by: string;
+    when: string;
+    message: string;
+    minorEdit: boolean;
+}
+
+export interface ConfluenceDeleteResult {
+    id: string;
+    deleted: boolean;
 }
 
 export interface ConfluencePageSummary {
@@ -315,6 +362,94 @@ export class ConfluenceClient {
             space: child.space?.key || child.space?.name || "Unknown",
             url: buildPageUrl(this.options.baseUrl, child._links?.webui),
         }));
+    }
+    /** Lists files attached to a page. */
+    async listAttachments(pageId: string, limit = 100): Promise<ConfluenceAttachment[]> {
+        const response = await atlassianGet({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/content/${encodeURIComponent(pageId)}/child/attachment`,
+            query: { limit, expand: "version,history" },
+        });
+        return (response.results || []).map((attachment: any) => ({
+            id: attachment.id,
+            title: attachment.title || "",
+            mediaType: attachment.metadata?.mediaType || "application/octet-stream",
+            fileSize: attachment.extensions?.fileSize ?? 0,
+            author: attachment.history?.createdBy?.displayName
+                || attachment.history?.createdBy?.username
+                || "Unknown",
+            created: attachment.history?.createdDate || "",
+            downloadPath: attachment._links?.download || "",
+        }));
+    }
+    /**
+     * Downloads a page attachment to an absolute path inside the allowlist.
+     * Same reasoning as the Jira side: page content is authored by other
+     * people, so an unrestricted write target is a liability.
+     */
+    async downloadAttachment(
+        pageId: string,
+        attachmentId: string,
+        outputPath: string,
+    ): Promise<ConfluenceAttachmentDownload> {
+        const safeOutputPath = await assertAttachmentPathAllowed(this.options, outputPath, "outputPath");
+        const attachments = await this.listAttachments(pageId);
+        const attachment = attachments.find((item) => item.id === attachmentId);
+        if (!attachment) {
+            throw new Error(`Attachment ${attachmentId} was not found on page ${pageId}.`);
+        }
+        if (!attachment.downloadPath) {
+            throw new Error(`Attachment ${attachmentId} has no download link.`);
+        }
+        assertAttachmentSize(this.options, attachment.fileSize, "declared size");
+        const response = await atlassianGetBinary({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: attachment.downloadPath,
+            maxResponseBytes: this.options.maxAttachmentBytes ?? DEFAULT_MAX_ATTACHMENT_BYTES,
+        });
+        assertAttachmentSize(this.options, response.data.byteLength, "download size");
+        await writeNewAttachment(this.options, safeOutputPath, response.data);
+        return {
+            id: attachmentId,
+            title: attachment.title,
+            outputPath: safeOutputPath,
+            bytesWritten: response.data.byteLength,
+            contentType: response.contentType,
+        };
+    }
+    /**
+     * Returns a page's version history: who changed it, when, and with what
+     * message. Useful for judging whether a page is still current.
+     */
+    async getPageHistory(pageId: string, limit = 50): Promise<ConfluencePageVersion[]> {
+        const response = await atlassianGet({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/experimental/content/${encodeURIComponent(pageId)}/version`,
+            query: { limit },
+        });
+        return (response.results || []).map((version: any) => ({
+            number: version.number,
+            by: version.by?.displayName || version.by?.username || "Unknown",
+            when: version.when || "",
+            message: version.message || "",
+            minorEdit: version.minorEdit === true,
+        }));
+    }
+    /**
+     * Deletes a page. Confluence moves it to the space's trash rather than
+     * erasing it, so this is recoverable by an admin — but treat it as
+     * destructive.
+     */
+    async deletePage(pageId: string): Promise<ConfluenceDeleteResult> {
+        await atlassianDelete({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/content/${encodeURIComponent(pageId)}`,
+        });
+        return { id: pageId, deleted: true };
     }
     /**
      * Creates a new Confluence page. `body` may be plain text or simple HTML;

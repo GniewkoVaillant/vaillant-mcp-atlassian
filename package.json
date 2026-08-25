@@ -16,9 +16,11 @@
     "dev": "tsc -p tsconfig.json --watch",
     "inspector": "npx @modelcontextprotocol/inspector node dist/index.js",
     "deploy": "npm run build && node scripts/deploy.mjs",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
     "test:unit": "npm run build && node --test dist/__tests__/*.test.js",
     "test:smoke": "npm run build && node scripts/smoke-test.mjs",
-    "test": "npm run test:unit && npm run test:smoke"
+    "test": "npm run lint && npm run test:unit && npm run test:smoke"
   },
   "keywords": [
     "mcp",
@@ -37,7 +39,10 @@
     "zod": "^3.24.1"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.5",
     "@types/node": "^22.10.2",
-    "typescript": "^5.7.2"
+    "eslint": "^9.39.5",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.68.0"
   }
 }

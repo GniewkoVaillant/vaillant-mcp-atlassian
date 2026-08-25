@@ -12,6 +12,7 @@
 import { McpServer, type ToolCallback } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
+import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { loadConfig, type ToolGroup } from "./config.js";
 import { JiraClient } from "./jiraClient.js";
@@ -39,16 +40,28 @@ function formatError(error: unknown): string {
 type ToolKind = "read" | "write" | "destructive" | "local";
 async function main() {
     const config = loadConfig();
-    configureHttp({ timeoutMs: config.timeoutMs });
+    configureHttp({
+        timeoutMs: config.timeoutMs,
+        totalTimeoutMs: config.totalTimeoutMs,
+        maxConcurrentRequests: config.maxConcurrentRequests,
+        maxQueuedRequests: config.maxQueuedRequests,
+    });
     const jiraClient = new JiraClient({
         baseUrl: config.jiraBaseUrl,
         pat: config.jiraPat,
         attachmentDirs: config.attachmentDirs,
+        maxAttachmentBytes: config.maxAttachmentBytes,
     });
-    const jiraAgileClient = new JiraAgileClient({ baseUrl: config.jiraBaseUrl, pat: config.jiraPat });
+    const jiraAgileClient = new JiraAgileClient({
+        baseUrl: config.jiraBaseUrl,
+        pat: config.jiraPat,
+        maxPaginationPages: config.maxPaginationPages,
+    });
     const confluenceClient = new ConfluenceClient({
         baseUrl: config.confluenceBaseUrl,
         pat: config.confluencePat,
+        attachmentDirs: config.attachmentDirs,
+        maxAttachmentBytes: config.maxAttachmentBytes,
     });
     const server = new McpServer(
         {
@@ -75,9 +88,9 @@ async function main() {
     }
     /**
      * Registers a tool, but only when its group is enabled by the active
-     * profile and — for mutating tools — when the server is not in read-only
-     * mode. Attaches MCP annotations so clients can tell a lookup apart from a
-     * deletion without parsing the prose description.
+     * profile and server-side safety policy permit it. Destructive tools are
+     * absent unless an operator explicitly enabled them; client annotations
+     * remain informative and are never treated as authorization controls.
      */
     function tool<InputArgs extends z.ZodRawShape>(
         group: ToolGroup,
@@ -93,15 +106,18 @@ async function main() {
     ): void {
         if (!config.enabledGroups.has(group)) return;
         if (config.readOnly && kind !== "read") return;
+        if (kind === "destructive" && !config.allowDestructive) return;
         // Wrap the handler so every invocation is observable: duration and
         // outcome, never arguments — those routinely contain issue content.
         const instrumented = (async (...args: Parameters<typeof handler>) => {
             const startedAt = Date.now();
-            log("debug", { event: "tool.start", tool: name, kind });
+            const requestId = randomUUID();
+            log("debug", { event: "tool.start", requestId, tool: name, kind });
             try {
                 const result: any = await (handler as any)(...args);
                 log(result?.isError ? "error" : "info", {
                     event: "tool.finish",
+                    requestId,
                     tool: name,
                     kind,
                     ok: !result?.isError,
@@ -111,10 +127,11 @@ async function main() {
             } catch (error) {
                 log("error", {
                     event: "tool.throw",
+                    requestId,
                     tool: name,
                     kind,
                     durationMs: Date.now() - startedAt,
-                    message: formatError(error),
+                    errorType: error instanceof Error ? error.name : "UnknownError",
                 });
                 throw error;
             }
@@ -130,7 +147,8 @@ async function main() {
                     // Re-running a read or a delete converges on the same state;
                     // re-running a create does not.
                     idempotentHint: kind === "read" || kind === "destructive",
-                    openWorldHint: kind !== "local",
+                    // Even attachment tools contact a remote Atlassian host.
+                    openWorldHint: true,
                 },
             },
             instrumented,
@@ -411,7 +429,7 @@ async function main() {
             };
         }
     });
-    tool("files", "local", "jira_upload_attachment", {
+    tool("files", "write", "jira_upload_attachment", {
         title: "Upload Jira attachment",
         description: "Upload a local file as an attachment to a Jira issue. Mutates data: creates a real " +
             "attachment on the issue.",
@@ -711,6 +729,123 @@ async function main() {
             return {
                 isError: true,
                 content: [{ type: "text", text: `jira_delete_comment failed: ${formatError(error)}` }],
+            };
+        }
+    });
+    tool("write", "read", "jira_list_worklogs", {
+        title: "List Jira worklogs",
+        description: "List the worklog entries on a Jira Data Center issue, with id, author, time spent, " +
+            "start time and comment. Use it to see what has already been logged before adding more, " +
+            "or to find the id of an entry to delete. Read-only.",
+        inputSchema: {
+            issueKey: z.string().describe("Jira issue key, e.g. 'ABC-123'"),
+        },
+    }, async ({ issueKey }) => {
+        try {
+            const worklogs = await jiraClient.listWorklogs(issueKey);
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: worklogs.length === 0
+                            ? `No work has been logged on ${issueKey}.`
+                            : JSON.stringify(worklogs, null, 2),
+                    },
+                ],
+            };
+        }
+        catch (error) {
+            return {
+                isError: true,
+                content: [{ type: "text", text: `jira_list_worklogs failed: ${formatError(error)}` }],
+            };
+        }
+    });
+    tool("write", "destructive", "jira_delete_worklog", {
+        title: "Delete Jira worklog",
+        description: "Permanently delete a worklog entry from a Jira Data Center issue. Mutates data and cannot " +
+            "be undone. Jira normally only allows deleting your own worklogs unless you hold " +
+            "project-admin permissions.",
+        inputSchema: {
+            issueKey: z.string().describe("Jira issue key, e.g. 'ABC-123'"),
+            worklogId: z.string().describe("Worklog ID returned by jira_list_worklogs"),
+        },
+    }, async ({ issueKey, worklogId }) => {
+        try {
+            const result = await jiraClient.deleteWorklog(issueKey, worklogId);
+            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+        }
+        catch (error) {
+            return {
+                isError: true,
+                content: [{ type: "text", text: `jira_delete_worklog failed: ${formatError(error)}` }],
+            };
+        }
+    });
+    tool("write", "read", "jira_list_watchers", {
+        title: "List Jira issue watchers",
+        description: "List the users watching a Jira Data Center issue. Read-only.",
+        inputSchema: {
+            issueKey: z.string().describe("Jira issue key, e.g. 'ABC-123'"),
+        },
+    }, async ({ issueKey }) => {
+        try {
+            const watchers = await jiraClient.listWatchers(issueKey);
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: watchers.length === 0
+                            ? `Nobody is watching ${issueKey}.`
+                            : JSON.stringify(watchers, null, 2),
+                    },
+                ],
+            };
+        }
+        catch (error) {
+            return {
+                isError: true,
+                content: [{ type: "text", text: `jira_list_watchers failed: ${formatError(error)}` }],
+            };
+        }
+    });
+    tool("write", "write", "jira_add_watcher", {
+        title: "Add Jira issue watcher",
+        description: "Add a user as a watcher on a Jira Data Center issue, so they are notified of changes. " +
+            "Mutates data. Use the account's username (the `name` field), not the display name.",
+        inputSchema: {
+            issueKey: z.string().describe("Jira issue key, e.g. 'ABC-123'"),
+            username: z.string().describe("Username to add as a watcher"),
+        },
+    }, async ({ issueKey, username }) => {
+        try {
+            const result = await jiraClient.addWatcher(issueKey, username);
+            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+        }
+        catch (error) {
+            return {
+                isError: true,
+                content: [{ type: "text", text: `jira_add_watcher failed: ${formatError(error)}` }],
+            };
+        }
+    });
+    tool("write", "write", "jira_remove_watcher", {
+        title: "Remove Jira issue watcher",
+        description: "Remove a user from a Jira Data Center issue's watcher list. Mutates data, but is " +
+            "reversible by adding them back.",
+        inputSchema: {
+            issueKey: z.string().describe("Jira issue key, e.g. 'ABC-123'"),
+            username: z.string().describe("Username to remove from the watcher list"),
+        },
+    }, async ({ issueKey, username }) => {
+        try {
+            const result = await jiraClient.removeWatcher(issueKey, username);
+            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+        }
+        catch (error) {
+            return {
+                isError: true,
+                content: [{ type: "text", text: `jira_remove_watcher failed: ${formatError(error)}` }],
             };
         }
     });
@@ -1416,6 +1551,128 @@ async function main() {
             };
         }
     });
+    tool("files", "read", "confluence_list_attachments", {
+        title: "List Confluence page attachments",
+        description: "List files attached to a Confluence Data Center page, with id, title, media type, size, " +
+            "author and creation date. Read-only.",
+        inputSchema: {
+            pageId: z.string().describe("Confluence page ID, e.g. '601156620'"),
+            limit: z
+                .number()
+                .int()
+                .positive()
+                .max(500)
+                .optional()
+                .describe("Maximum attachments to return (default 100)"),
+        },
+    }, async ({ pageId, limit }) => {
+        try {
+            const attachments = await confluenceClient.listAttachments(pageId, limit ?? 100);
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: attachments.length === 0
+                            ? "This page has no attachments."
+                            : JSON.stringify(attachments, null, 2),
+                    },
+                ],
+            };
+        }
+        catch (error) {
+            return {
+                isError: true,
+                content: [
+                    { type: "text", text: `confluence_list_attachments failed: ${formatError(error)}` },
+                ],
+            };
+        }
+    });
+    tool("files", "local", "confluence_download_attachment", {
+        title: "Download a Confluence attachment",
+        description: "Download a Confluence Data Center page attachment to an explicit absolute path on the " +
+            "local machine. The path must sit inside ATLASSIAN_ATTACHMENT_DIRS, which is empty by " +
+            "default, so this is disabled until deliberately enabled. Writes a local file but does not " +
+            "modify Confluence.",
+        inputSchema: {
+            pageId: z.string().describe("Confluence page ID the attachment belongs to"),
+            attachmentId: z.string().describe("Attachment ID returned by confluence_list_attachments"),
+            outputPath: z.string().describe("Absolute local destination path, including filename"),
+        },
+    }, async ({ pageId, attachmentId, outputPath }) => {
+        try {
+            const result = await confluenceClient.downloadAttachment(pageId, attachmentId, outputPath);
+            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+        }
+        catch (error) {
+            return {
+                isError: true,
+                content: [
+                    { type: "text", text: `confluence_download_attachment failed: ${formatError(error)}` },
+                ],
+            };
+        }
+    });
+    tool("core", "read", "confluence_get_page_history", {
+        title: "Get Confluence page history",
+        description: "Get a Confluence Data Center page's version history: version number, author, timestamp, " +
+            "edit message and whether it was a minor edit. Useful for judging whether a page is still " +
+            "current. Read-only.",
+        inputSchema: {
+            pageId: z.string().describe("Confluence page ID, e.g. '601156620'"),
+            limit: z
+                .number()
+                .int()
+                .positive()
+                .max(200)
+                .optional()
+                .describe("Maximum versions to return (default 50)"),
+        },
+    }, async ({ pageId, limit }) => {
+        try {
+            const history = await confluenceClient.getPageHistory(pageId, limit ?? 50);
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: history.length === 0
+                            ? "No version history was returned for this page."
+                            : JSON.stringify(history, null, 2),
+                    },
+                ],
+            };
+        }
+        catch (error) {
+            return {
+                isError: true,
+                content: [
+                    { type: "text", text: `confluence_get_page_history failed: ${formatError(error)}` },
+                ],
+            };
+        }
+    });
+    tool("write", "destructive", "confluence_delete_page", {
+        title: "Delete a Confluence page",
+        description: "Delete a Confluence Data Center page. Mutates data: Confluence moves the page to the " +
+            "space's trash rather than erasing it, so an admin can restore it, but treat this as " +
+            "destructive. Child pages are affected too — check confluence_get_page_children first.",
+        inputSchema: {
+            pageId: z.string().describe("Confluence page ID to delete"),
+        },
+    }, async ({ pageId }) => {
+        try {
+            const result = await confluenceClient.deletePage(pageId);
+            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+        }
+        catch (error) {
+            return {
+                isError: true,
+                content: [
+                    { type: "text", text: `confluence_delete_page failed: ${formatError(error)}` },
+                ],
+            };
+        }
+    });
     tool("write", "write", "confluence_create_page", {
         title: "Create Confluence page",
         description: "Create a new Confluence Data Center page. Mutates data: sends a POST request that creates a " +
@@ -1486,11 +1743,15 @@ async function main() {
     // tools and looks like a client bug.
     const profile = process.env.ATLASSIAN_PROFILE?.trim() || "full";
     const groups = [...config.enabledGroups].sort().join(", ");
+    // Startup banner goes to stderr on purpose (see comment above).
+    // eslint-disable-next-line no-console
     console.error(
         `mcp-atlassian started (stdio). profile=${profile} groups=[${groups}] ` +
             `tools=${registered.length}${config.readOnly ? " READ-ONLY" : ""} ` +
-            `attachments=${config.attachmentDirs.length > 0 ? config.attachmentDirs.join(":") : "disabled"} ` +
-            `timeout=${config.timeoutMs}ms`,
+            `destructive=${config.allowDestructive && !config.readOnly ? "ENABLED" : "disabled"} ` +
+            `attachments=${config.attachmentDirs.length > 0 ? "enabled" : "disabled"} ` +
+            `timeout=${config.timeoutMs}ms totalTimeout=${config.totalTimeoutMs}ms ` +
+            `concurrency=${config.maxConcurrentRequests} queue=${config.maxQueuedRequests}`,
     );
 }
 main().catch((error) => {

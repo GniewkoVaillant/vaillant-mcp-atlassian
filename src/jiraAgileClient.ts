@@ -10,7 +10,13 @@ import { DEFAULT_CONCURRENCY, mapWithConcurrency } from "./concurrency.js";
 export interface ClientOptions {
     baseUrl: string;
     pat: string;
+    /** Maximum number of pages fetched by any one automatically paginated call. */
+    maxPaginationPages?: number;
 }
+
+const DEFAULT_MAX_PAGINATION_PAGES = 10;
+
+type PaginationQuery = Record<string, string | number | boolean | undefined>;
 
 export interface JiraBoardSummary {
     id: number;
@@ -113,8 +119,112 @@ function round2(value: number): number {
 }
 export class JiraAgileClient {
     private readonly options: ClientOptions;
+    private readonly maxPaginationPages: number;
+
     constructor(options: ClientOptions) {
         this.options = options;
+        this.maxPaginationPages = options.maxPaginationPages ?? DEFAULT_MAX_PAGINATION_PAGES;
+        if (!Number.isSafeInteger(this.maxPaginationPages) || this.maxPaginationPages <= 0) {
+            throw new Error("maxPaginationPages must be a positive safe integer.");
+        }
+    }
+
+    /**
+     * Jira DC deployments do not always agree on which pagination metadata is
+     * returned. Cap upstream calls, reject stalled/repeated pages and never
+     * pass incomplete results off as a complete board, sprint or issue list.
+     */
+    private async getPaginatedValues(
+        path: string,
+        itemProperty: "values" | "issues",
+        maxResults: number,
+        query: PaginationQuery,
+        resourceName: string,
+    ): Promise<any[]> {
+        const results: any[] = [];
+        const seenPageSignatures = new Set<string>();
+        let startAt = 0;
+
+        for (let pageNumber = 1; pageNumber <= this.maxPaginationPages; pageNumber += 1) {
+            const page = await atlassianGet({
+                baseUrl: this.options.baseUrl,
+                pat: this.options.pat,
+                path,
+                query: { startAt, maxResults, ...query },
+            });
+            const rawValues = page?.[itemProperty];
+            if (rawValues !== undefined && !Array.isArray(rawValues)) {
+                throw new Error(
+                    `Jira ${resourceName} pagination returned an invalid ${itemProperty} page.`,
+                );
+            }
+            const values: any[] = rawValues ?? [];
+
+            if (page?.startAt !== undefined && page.startAt !== startAt) {
+                throw new Error(
+                    `Jira ${resourceName} pagination did not advance: requested startAt=${startAt}, ` +
+                    `but the server returned startAt=${String(page.startAt)}.`,
+                );
+            }
+
+            const total = page?.total;
+            if (
+                total !== undefined &&
+                (!Number.isSafeInteger(total) || total < 0)
+            ) {
+                throw new Error(
+                    `Jira ${resourceName} pagination returned an invalid total.`,
+                );
+            }
+
+            if (values.length === 0) {
+                if (page?.isLast === false || (total !== undefined && startAt < total)) {
+                    throw new Error(
+                        `Jira ${resourceName} pagination did not advance: an empty page was ` +
+                        `returned at startAt=${startAt} before all results were retrieved.`,
+                    );
+                }
+                return results;
+            }
+
+            const identifiers = values.map((value) => value?.id ?? value?.key);
+            if (identifiers.every((identifier) =>
+                typeof identifier === "string" || typeof identifier === "number"
+            )) {
+                const signature = JSON.stringify(identifiers);
+                if (seenPageSignatures.has(signature)) {
+                    throw new Error(
+                        `Jira ${resourceName} pagination returned a repeated page at ` +
+                        `startAt=${startAt}; refusing to return duplicated or incomplete data.`,
+                    );
+                }
+                seenPageSignatures.add(signature);
+            }
+
+            results.push(...values);
+            startAt += values.length;
+
+            if (
+                page?.isLast === true ||
+                (total !== undefined && startAt >= total)
+            ) {
+                return results;
+            }
+
+            if (pageNumber === this.maxPaginationPages) {
+                const totalHint = total === undefined ? "" : ` of ${total}`;
+                throw new Error(
+                    `Jira ${resourceName} pagination stopped after the configured limit of ` +
+                    `${this.maxPaginationPages} pages (${results.length}${totalHint} results fetched). ` +
+                    `Narrow the query or cautiously increase ATLASSIAN_MAX_PAGINATION_PAGES; ` +
+                    `partial results were not returned.`,
+                );
+            }
+        }
+
+        // The constructor guarantees a positive page budget, so this can only
+        // be reached if future changes break the pagination invariant.
+        throw new Error(`Jira ${resourceName} pagination ended unexpectedly.`);
     }
     /**
      * Lists boards visible to the PAT's owner, optionally filtered by name or
@@ -122,29 +232,13 @@ export class JiraAgileClient {
      * way to discover one from inside the agent.
      */
     async listBoards(options: { name?: string; projectKeyOrId?: string } = {}): Promise<JiraBoardSummary[]> {
-        const boards: any[] = [];
-        let startAt = 0;
-        const maxResults = 50;
-        for (;;) {
-            const page = await atlassianGet({
-                baseUrl: this.options.baseUrl,
-                pat: this.options.pat,
-                path: "/rest/agile/1.0/board",
-                query: {
-                    startAt,
-                    maxResults,
-                    name: options.name,
-                    projectKeyOrId: options.projectKeyOrId,
-                },
-            });
-            const values = page.values || [];
-            boards.push(...values);
-            const gotAll = page.isLast === true ||
-                values.length === 0 ||
-                (page.total !== undefined && boards.length >= page.total);
-            if (gotAll) break;
-            startAt += values.length;
-        }
+        const boards = await this.getPaginatedValues(
+            "/rest/agile/1.0/board",
+            "values",
+            50,
+            { name: options.name, projectKeyOrId: options.projectKeyOrId },
+            "board",
+        );
         return boards.map((board) => ({
             id: board.id,
             name: board.name || "",
@@ -158,29 +252,13 @@ export class JiraAgileClient {
      * If `state` is omitted, all sprints (active, closed, future) are returned.
      */
     async getBoardSprints(boardId: number, state?: string): Promise<JiraSprintSummary[]> {
-        const sprints: any[] = [];
-        let startAt = 0;
-        const maxResults = 50;
-        for (;;) {
-            const page = await atlassianGet({
-                baseUrl: this.options.baseUrl,
-                pat: this.options.pat,
-                path: `/rest/agile/1.0/board/${boardId}/sprint`,
-                query: {
-                    startAt,
-                    maxResults,
-                    state,
-                },
-            });
-            sprints.push(...(page.values || []));
-            const gotAll = page.isLast === true ||
-                !page.values ||
-                page.values.length === 0 ||
-                (page.total !== undefined && sprints.length >= page.total);
-            if (gotAll)
-                break;
-            startAt += page.values.length;
-        }
+        const sprints = await this.getPaginatedValues(
+            `/rest/agile/1.0/board/${boardId}/sprint`,
+            "values",
+            50,
+            { state },
+            "sprint",
+        );
         return sprints.map(toSprintSummary);
     }
     /**
@@ -204,27 +282,13 @@ export class JiraAgileClient {
         const fieldsParam = ["summary", "status", "issuetype", "assignee"];
         if (storyPointsField)
             fieldsParam.push(storyPointsField);
-        const issues: any[] = [];
-        let startAt = 0;
-        const maxResults = 100;
-        for (;;) {
-            const page = await atlassianGet({
-                baseUrl: this.options.baseUrl,
-                pat: this.options.pat,
-                path: `/rest/agile/1.0/sprint/${sprintId}/issue`,
-                query: {
-                    startAt,
-                    maxResults,
-                    fields: fieldsParam.join(","),
-                },
-            });
-            issues.push(...(page.issues || []));
-            const total = page.total ?? issues.length;
-            if (issues.length >= total || !page.issues || page.issues.length === 0)
-                break;
-            startAt += page.issues.length;
-        }
-        return issues;
+        return this.getPaginatedValues(
+            `/rest/agile/1.0/sprint/${sprintId}/issue`,
+            "issues",
+            100,
+            { fields: fieldsParam.join(",") },
+            "sprint issue",
+        );
     }
     /**
      * Fetches Jira's own sprint report from the greenhopper API, which is the

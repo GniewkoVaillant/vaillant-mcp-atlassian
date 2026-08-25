@@ -33,6 +33,10 @@ const hasRealCredentials =
       process.env.CONFLUENCE_PAT,
   ) || existsSync(envFileCandidate);
 
+// A routine build must never query production merely because local .env
+// credentials happen to exist. Live checks require a deliberate operator opt-in.
+const runLiveChecks = hasRealCredentials && process.env.ATLASSIAN_SMOKE_LIVE === "true";
+
 const env = hasRealCredentials
   ? { ...process.env }
   : {
@@ -141,7 +145,11 @@ try {
   const destructive = tools.filter((tool) => tool.annotations?.destructiveHint);
   console.log(`  info  ${destructive.length} destructive tools: ${destructive.map((t) => t.name).join(", ") || "none"}`);
 
-  if (hasRealCredentials) {
+  if (!hasRealCredentials && process.env.ATLASSIAN_ALLOW_DESTRUCTIVE !== "true") {
+    check("destructive tools disabled by default", destructive.length === 0);
+  }
+
+  if (runLiveChecks) {
     console.log("live read-only calls");
 
     const jira = await request("tools/call", {
@@ -159,7 +167,11 @@ try {
     check("confluence_search_pages", confluenceResult.ok, confluenceResult.text.slice(0, 200));
   } else {
     console.log("live read-only calls");
-    console.log("  skip  no credentials in environment");
+    console.log(
+      hasRealCredentials
+        ? "  skip  set ATLASSIAN_SMOKE_LIVE=true to explicitly enable upstream calls"
+        : "  skip  no credentials in environment",
+    );
   }
 } catch (error) {
   console.error(`\nsmoke test aborted: ${error.message}`);

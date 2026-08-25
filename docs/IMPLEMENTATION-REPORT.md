@@ -4,6 +4,12 @@
 **Repository:** `GniewkoVaillant/vaillant-mcp-atlassian` (private)
 **Date:** 2026-08-25
 
+**Reading note:** Sections 1-7 preserve the original historical report and its
+measurements. The subsequent security-hardening phase supersedes historical
+claims about deletion exposure, HTTP guarantees, tool counts and outstanding
+features. Current controls and future Azure boundaries are documented in
+`SECURITY-ARCHITECTURE.md`.
+
 ---
 
 ## 1. Where this started
@@ -222,6 +228,79 @@ Seven new tools and richer descriptions pushed the full surface past the origina
 
 **Dead code.** Writing the ProForma tests surfaced that the "Missing chunk N/M" branch in `decodeProformaDesign` is unreachable: a gap in the chunk set is always caught earlier by the incomplete-set check. Harmless, but it is not the safety net it appears to be.
 
-**Testing.** 43 unit tests cover the pure logic and the smoke test covers startup, surface and connectivity. Untested: the HTTP layer's retry and timeout behaviour, which would need a stub server, and every client method that talks to Jira or Confluence.
+**Historical testing at that phase.** The early suite contained 43 unit tests.
+The current suite also covers the HTTP retry/deadline layer, bounded queues,
+redirect policy, binary response limits, pagination and server policy. Current
+verification results are recorded below rather than inferred from that early
+snapshot.
 
 **Security.** Tokens are plaintext in `.env` (mode 600) — see above.
+
+---
+
+## 8. Security-hardening phase and multi-agent handoff
+
+### Decisions
+
+- Destructive tools are disabled by default and require the explicit
+  `ATLASSIAN_ALLOW_DESTRUCTIVE=true` operator override. Read-only mode and the
+  named `read` profile always take precedence.
+- Upstream availability protection applies to the whole Jira/Confluence
+  process: finite concurrency, finite waiting queue, one end-to-end deadline,
+  bounded retry delay, bounded ProForma fan-out and capped Agile pagination.
+- Attachment operations are deny-by-default, canonical-path constrained,
+  symlink-aware, size-limited and protected against accidental overwrite.
+- Local credentials require HTTPS upstream URLs and a private Unix `.env`.
+  Correlated invocation telemetry excludes PATs, arguments and content.
+- Azure/Entra deployment requires one verified Jira PAT and one verified
+  Confluence PAT per authenticated user; a shared service PAT cannot satisfy
+  per-user upstream permissions or audit attribution.
+
+### Configuration contract
+
+| Setting | Default | Control |
+|---|---:|---|
+| `ATLASSIAN_ALLOW_DESTRUCTIVE` | `false` | Delete tools are not registered |
+| `ATLASSIAN_TIMEOUT_MS` | `30000` | One upstream HTTP attempt |
+| `ATLASSIAN_TOTAL_TIMEOUT_MS` | `45000` | Queueing, retry and total request budget |
+| `ATLASSIAN_MAX_CONCURRENT_REQUESTS` | `4` | Shared upstream concurrency |
+| `ATLASSIAN_MAX_QUEUED_REQUESTS` | `16` | Finite waiting queue |
+| `ATLASSIAN_MAX_ATTACHMENT_BYTES` | `10485760` | Attachment maximum size |
+| `ATLASSIAN_MAX_PAGINATION_PAGES` | `10` | Automatic Jira Agile pagination budget |
+| `ATLASSIAN_SMOKE_LIVE` | `false` | Explicit opt-in for authenticated live smoke checks |
+
+### Verification boundaries
+
+The default unit suite must exercise destructive-tool exclusion, the enforced
+read-only profile, configuration validation, protected local environment
+files, bounded HTTP behavior, safe attachment paths and bounded pagination.
+The stdio smoke test validates MCP discovery without making upstream calls.
+Authenticated, read-only Jira/Confluence checks require the explicit
+`ATLASSIAN_SMOKE_LIVE=true` opt-in.
+No write, delete or deployment operation is required to validate this phase.
+
+### Verified results
+
+| Check | Result |
+|---|---|
+| Strict TypeScript check | `npx tsc -p tsconfig.json --noEmit` passed |
+| Complete local suite | `npm test`: 125 tests passed; 0 failures |
+| HTTP resilience regressions | 40 tests passed, including queue, deadlines, redirect and binary-size cases |
+| Default MCP surface | 48 tools; 18 non-read tools; 0 destructive tools; approximately 10,125 tokens |
+| Existing installation configuration | 39 tools; 0 destructive tools; approximately 7,985 tokens |
+| Named `read` profile | 30 tools; 0 mutations; 0 destructive tools; approximately 6,010 tokens |
+| Explicit destructive opt-in | 54 tools; 6 destructive tools; approximately 11,110 tokens |
+| Read-only plus destructive opt-in | 30 tools; 0 mutations; 0 destructive tools |
+| Existing installation `.env` compatibility | Startup and MCP handshake passed; token values were never displayed |
+| Live Jira/Confluence traffic | Not performed; intentionally disabled without explicit opt-in |
+| Deployment to an active MCP installation | Not performed; requires a separately authorized deployment |
+
+### Remaining work
+
+Azure hosting, Streamable HTTP, Entra authentication, personal PAT enrollment,
+Key Vault isolation, distributed rate limiting and durable attributed audit
+storage remain future work. The executable implementation sequence, identity
+and network design, acceptance tests, release gates and rollback procedure are
+recorded in `AZURE-DEPLOYMENT.md`. Trust boundaries remain in
+`SECURITY-ARCHITECTURE.md`; repository collaboration rules are recorded in the
+project-root `AGENTS.md`.

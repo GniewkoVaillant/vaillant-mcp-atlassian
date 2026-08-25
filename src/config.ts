@@ -2,9 +2,10 @@
  * Loads and validates configuration from environment variables.
  * Fails fast with a clear error message if required variables are missing.
  */
-import { readFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { readFileSync, statSync } from "node:fs";
+import { delimiter, dirname, isAbsolute, join, parse, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { DEFAULT_MAX_ATTACHMENT_BYTES } from "./attachmentSecurity.js";
 
 /** Tool groups that can be enabled/disabled to control the tools/list payload. */
 export type ToolGroup = "core" | "forms" | "write" | "files" | "links" | "agile" | "dev";
@@ -24,7 +25,9 @@ const PROFILES: Record<string, ToolGroup[]> = {
   full: ALL_TOOL_GROUPS,
   ppm: ["core", "forms", "write", "files", "links"],
   agile: ["core", "agile", "dev"],
-  read: ["core", "forms", "agile", "dev", "links"],
+  // Registration still removes writes; including every group preserves all
+  // read-only discovery tools, even those historically grouped with writes.
+  read: ALL_TOOL_GROUPS,
   core: ["core"],
 };
 
@@ -37,12 +40,24 @@ export interface AtlassianConfig {
   confluencePat: string;
   /** When true, every mutating tool is refused before any network call. */
   readOnly: boolean;
+  /** Destructive tools are absent unless an operator explicitly opts in. */
+  allowDestructive: boolean;
   /** Tool groups exposed via tools/list. */
   enabledGroups: Set<ToolGroup>;
   /** Absolute directories that attachment download/upload may touch. */
   attachmentDirs: string[];
   /** Per-request HTTP timeout in milliseconds. */
   timeoutMs: number;
+  /** End-to-end HTTP deadline, including queueing and retry delays. */
+  totalTimeoutMs: number;
+  /** Process-wide upper bound on simultaneous upstream requests. */
+  maxConcurrentRequests: number;
+  /** Maximum requests permitted to wait for an upstream slot. */
+  maxQueuedRequests: number;
+  /** Largest attachment accepted for upload or download. */
+  maxAttachmentBytes: number;
+  /** Maximum pages automatically traversed by a Jira Agile operation. */
+  maxPaginationPages: number;
 }
 
 /**
@@ -64,6 +79,17 @@ function loadEnvFile(): string | null {
       contents = readFileSync(candidate, "utf8");
     } catch {
       continue;
+    }
+
+    const fileInfo = statSync(candidate);
+    if (!fileInfo.isFile()) {
+      throw new Error(`Atlassian environment file "${candidate}" must be a regular file.`);
+    }
+    if (process.platform !== "win32" && (fileInfo.mode & 0o077) !== 0) {
+      throw new Error(
+        `Atlassian environment file "${candidate}" is accessible to other users. ` +
+          `Run chmod 600 on that file before starting the server.`,
+      );
     }
 
     for (const rawLine of contents.split("\n")) {
@@ -108,9 +134,27 @@ function requireEnv(name: string): string {
   return value;
 }
 
-/** Removes a trailing slash so we can safely concatenate paths. */
-function normalizeBaseUrl(url: string): string {
-  return url.endsWith("/") ? url.slice(0, -1) : url;
+/** Rejects credential-bearing or non-TLS URLs before any PAT can be sent. */
+function normalizeBaseUrl(raw: string, name: string): string {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error(`Invalid ${name}. Expected an absolute HTTPS URL.`);
+  }
+
+  const isLoopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && isLoopback)) {
+    throw new Error(`${name} must use HTTPS; HTTP is allowed only for local loopback testing.`);
+  }
+  if (url.username || url.password) {
+    throw new Error(`${name} must not contain embedded credentials.`);
+  }
+  if (url.search || url.hash) {
+    throw new Error(`${name} must not contain a query string or fragment.`);
+  }
+
+  return raw.endsWith("/") ? raw.slice(0, -1) : raw;
 }
 
 function parseBoolean(raw: string | undefined, fallback: boolean): boolean {
@@ -121,13 +165,27 @@ function parseBoolean(raw: string | undefined, fallback: boolean): boolean {
   throw new Error(`Invalid boolean value "${raw}". Use true/false.`);
 }
 
-function parseTimeout(raw: string | undefined): number {
-  if (raw === undefined || raw.trim() === "") return 30_000;
+function parsePositiveInteger(
+  raw: string | undefined,
+  name: string,
+  fallback: number,
+  maximum: number,
+): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
   const value = Number(raw);
-  if (!Number.isFinite(value) || value <= 0) {
+  if (!Number.isSafeInteger(value) || value <= 0 || value > maximum) {
     throw new Error(
-      `Invalid ATLASSIAN_TIMEOUT_MS "${raw}". Expected a positive number of milliseconds.`,
+      `Invalid ${name} "${raw}". Expected an integer between 1 and ${maximum}.`,
     );
+  }
+  return value;
+}
+
+function parseQueueLimit(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return 16;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 0 || value > 256) {
+    throw new Error(`Invalid ATLASSIAN_MAX_QUEUED_REQUESTS "${raw}". Expected an integer between 0 and 256.`);
   }
   return value;
 }
@@ -172,9 +230,18 @@ function parseProfile(raw: string | undefined): Set<ToolGroup> {
 function parseAttachmentDirs(raw: string | undefined): string[] {
   if (raw === undefined || raw.trim() === "") return [];
   return raw
-    .split(":")
+    .split(delimiter)
     .map((part) => part.trim())
-    .filter((part) => part.length > 0);
+    .filter((part) => part.length > 0)
+    .map((directory) => {
+      if (!isAbsolute(directory) || resolve(directory) === parse(resolve(directory)).root) {
+        throw new Error(
+          `Invalid ATLASSIAN_ATTACHMENT_DIRS entry "${directory}". ` +
+            `Use an absolute directory other than the filesystem root.`,
+        );
+      }
+      return directory;
+    });
 }
 
 export function loadConfig(): AtlassianConfig {
@@ -200,13 +267,41 @@ export function loadConfig(): AtlassianConfig {
 
   return {
     envFile,
-    jiraBaseUrl: normalizeBaseUrl(requireEnv("JIRA_BASE_URL")),
+    jiraBaseUrl: normalizeBaseUrl(requireEnv("JIRA_BASE_URL"), "JIRA_BASE_URL"),
     jiraPat: requireEnv("JIRA_PAT"),
-    confluenceBaseUrl: normalizeBaseUrl(requireEnv("CONFLUENCE_BASE_URL")),
+    confluenceBaseUrl: normalizeBaseUrl(requireEnv("CONFLUENCE_BASE_URL"), "CONFLUENCE_BASE_URL"),
     confluencePat: requireEnv("CONFLUENCE_PAT"),
-    readOnly: parseBoolean(process.env.ATLASSIAN_READ_ONLY, false),
+    readOnly:
+      parseBoolean(process.env.ATLASSIAN_READ_ONLY, false) ||
+      process.env.ATLASSIAN_PROFILE?.trim().toLowerCase() === "read",
+    allowDestructive: parseBoolean(process.env.ATLASSIAN_ALLOW_DESTRUCTIVE, false),
     enabledGroups: parseProfile(process.env.ATLASSIAN_PROFILE),
     attachmentDirs: parseAttachmentDirs(process.env.ATLASSIAN_ATTACHMENT_DIRS),
-    timeoutMs: parseTimeout(process.env.ATLASSIAN_TIMEOUT_MS),
+    timeoutMs: parsePositiveInteger(process.env.ATLASSIAN_TIMEOUT_MS, "ATLASSIAN_TIMEOUT_MS", 30_000, 300_000),
+    totalTimeoutMs: parsePositiveInteger(
+      process.env.ATLASSIAN_TOTAL_TIMEOUT_MS,
+      "ATLASSIAN_TOTAL_TIMEOUT_MS",
+      45_000,
+      300_000,
+    ),
+    maxConcurrentRequests: parsePositiveInteger(
+      process.env.ATLASSIAN_MAX_CONCURRENT_REQUESTS,
+      "ATLASSIAN_MAX_CONCURRENT_REQUESTS",
+      4,
+      64,
+    ),
+    maxQueuedRequests: parseQueueLimit(process.env.ATLASSIAN_MAX_QUEUED_REQUESTS),
+    maxAttachmentBytes: parsePositiveInteger(
+      process.env.ATLASSIAN_MAX_ATTACHMENT_BYTES,
+      "ATLASSIAN_MAX_ATTACHMENT_BYTES",
+      DEFAULT_MAX_ATTACHMENT_BYTES,
+      100 * 1024 * 1024,
+    ),
+    maxPaginationPages: parsePositiveInteger(
+      process.env.ATLASSIAN_MAX_PAGINATION_PAGES,
+      "ATLASSIAN_MAX_PAGINATION_PAGES",
+      10,
+      100,
+    ),
   };
 }

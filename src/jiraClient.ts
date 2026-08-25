@@ -4,8 +4,14 @@
  * (mutating) operations such as creating/updating issues, commenting,
  * and transitioning issues between statuses.
  */
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
+import { basename } from "node:path";
+import {
+    assertAttachmentPathAllowed,
+    assertAttachmentSize,
+    DEFAULT_MAX_ATTACHMENT_BYTES,
+    readExistingAttachment,
+    writeNewAttachment,
+} from "./attachmentSecurity.js";
 import { atlassianDelete, atlassianGet, atlassianGetBinary, atlassianPost, atlassianPostFormData, atlassianPut, AtlassianHttpError, } from "./httpClient.js";
 import { decodeProformaDesign, formatProformaAnswer, getProformaChunkCount, } from "./proforma.js";
 import { DEFAULT_CONCURRENCY, mapWithConcurrency } from "./concurrency.js";
@@ -20,7 +26,11 @@ export interface ClientOptions {
      * must not be able to talk the agent into reading arbitrary local files.
      */
     attachmentDirs?: string[];
+    /** Maximum number of bytes accepted for attachment uploads and downloads. */
+    maxAttachmentBytes?: number;
 }
+
+const MAX_PROFORMA_CHUNKS = 25;
 
 export interface JiraIssueSummary {
     key: string;
@@ -224,6 +234,28 @@ export interface JiraWorklogResult {
     comment: string;
 }
 
+export interface JiraWorklogEntry extends JiraWorklogResult {
+    timeSpentSeconds: number;
+    created: string;
+}
+
+export interface JiraDeleteResult {
+    id: string;
+    deleted: boolean;
+}
+
+export interface JiraWatcher {
+    name: string;
+    displayName: string;
+    active: boolean;
+}
+
+export interface JiraWatcherResult {
+    issueKey: string;
+    username: string;
+    watching: boolean;
+}
+
 export interface JiraAddWorklogWithCategoryOptions {
     timeSpent: string;
     category: string;
@@ -417,36 +449,6 @@ export class JiraClient {
         });
         this.fieldDefinitions = { fetchedAt: Date.now(), fields: fields || [] };
         return this.fieldDefinitions.fields;
-    }
-    /**
-     * Rejects any attachment path outside the configured allowlist. Paths are
-     * resolved first so that `..` segments and symlink-style traversal cannot
-     * escape an allowed directory.
-     */
-    private assertAttachmentPathAllowed(candidate: string, label: string): string {
-        if (!isAbsolute(candidate)) {
-            throw new Error(`Attachment ${label} must be an absolute path`);
-        }
-        const allowed = this.options.attachmentDirs ?? [];
-        if (allowed.length === 0) {
-            throw new Error(
-                "Attachment access is disabled. Set ATLASSIAN_ATTACHMENT_DIRS to a " +
-                    "colon-separated list of directories to enable it.",
-            );
-        }
-        const resolved = resolve(candidate);
-        const permitted = allowed.some((dir) => {
-            const root = resolve(dir);
-            const rel = relative(root, resolved);
-            return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
-        });
-        if (!permitted) {
-            throw new Error(
-                `Attachment ${label} "${resolved}" is outside the allowed directories ` +
-                    `(${allowed.join(", ")}).`,
-            );
-        }
-        return resolved;
     }
     async searchIssues(jql: string, maxResults = 20, startAt = 0): Promise<JiraIssueSearchResult> {
         const data = await atlassianGet({
@@ -673,7 +675,17 @@ export class JiraClient {
         const propertyKey = `proforma.forms.i${formId}`;
         const root = await this.getIssueProperty(issueKey, propertyKey);
         const chunkCount = getProformaChunkCount(root);
-        const additionalChunks = await Promise.all(Array.from({ length: Math.max(0, chunkCount - 1) }, (_, index) => this.getIssueProperty(issueKey, `${propertyKey}.${index + 1}`)));
+        if (chunkCount > MAX_PROFORMA_CHUNKS) {
+            throw new Error(
+                `ProForma form ${formId} declares ${chunkCount} chunks, exceeding the ` +
+                    `${MAX_PROFORMA_CHUNKS}-chunk safety limit.`,
+            );
+        }
+        const additionalChunks = await mapWithConcurrency(
+            Array.from({ length: Math.max(0, chunkCount - 1) }, (_, index) => index + 1),
+            DEFAULT_CONCURRENCY,
+            (index) => this.getIssueProperty(issueKey, `${propertyKey}.${index}`),
+        );
         const design = decodeProformaDesign(root, additionalChunks);
         const questions = design.questions || {};
         const stateAnswers = root.state?.answers || {};
@@ -727,7 +739,7 @@ export class JiraClient {
         }));
     }
     async downloadAttachment(attachmentId: string, outputPath: string): Promise<JiraAttachmentDownloadResult> {
-        const safeOutputPath = this.assertAttachmentPathAllowed(outputPath, "outputPath");
+        const safeOutputPath = await assertAttachmentPathAllowed(this.options, outputPath, "outputPath");
         const metadata = await atlassianGet({
             baseUrl: this.options.baseUrl,
             pat: this.options.pat,
@@ -736,13 +748,17 @@ export class JiraClient {
         if (!metadata.content) {
             throw new Error(`Jira attachment ${attachmentId} has no content URL`);
         }
+        if (typeof metadata.size === "number") {
+            assertAttachmentSize(this.options, metadata.size, "declared size");
+        }
         const response = await atlassianGetBinary({
             baseUrl: this.options.baseUrl,
             pat: this.options.pat,
             path: metadata.content,
+            maxResponseBytes: this.options.maxAttachmentBytes ?? DEFAULT_MAX_ATTACHMENT_BYTES,
         });
-        await mkdir(dirname(safeOutputPath), { recursive: true });
-        await writeFile(safeOutputPath, response.data);
+        assertAttachmentSize(this.options, response.data.byteLength, "download size");
+        await writeNewAttachment(this.options, safeOutputPath, response.data);
         return {
             id: attachmentId,
             outputPath: safeOutputPath,
@@ -751,8 +767,7 @@ export class JiraClient {
         };
     }
     async uploadAttachment(issueKey: string, filePath: string, mimeType = "application/octet-stream"): Promise<JiraAttachmentSummary[]> {
-        const safeFilePath = this.assertAttachmentPathAllowed(filePath, "filePath");
-        const data = await readFile(safeFilePath);
+        const { path: safeFilePath, data } = await readExistingAttachment(this.options, filePath);
         const form = new FormData();
         form.append("file", new Blob([data], { type: mimeType }), basename(safeFilePath));
         const uploaded = await atlassianPostFormData({
@@ -961,6 +976,74 @@ export class JiraClient {
      * Logs work against an existing Jira issue. Mutates data: POST
      * /rest/api/2/issue/{issueKey}/worklog.
      */
+    /**
+     * Lists worklogs on an issue. Needed to see what has already been logged
+     * before adding more, and to find the id of an entry to delete.
+     */
+    async listWorklogs(issueKey: string): Promise<JiraWorklogEntry[]> {
+        const response = await atlassianGet({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/2/issue/${encodeURIComponent(issueKey)}/worklog`,
+        });
+        return (response.worklogs || []).map((worklog: any) => ({
+            id: worklog.id,
+            issueKey,
+            author: userLabel(worklog.author),
+            timeSpent: worklog.timeSpent || "",
+            timeSpentSeconds: worklog.timeSpentSeconds ?? 0,
+            started: worklog.started || "",
+            created: worklog.created || "",
+            comment: worklog.comment || "",
+        }));
+    }
+    /**
+     * Permanently deletes a worklog entry. Jira normally restricts this to
+     * your own worklogs unless you hold project-admin rights.
+     */
+    async deleteWorklog(issueKey: string, worklogId: string): Promise<JiraDeleteResult> {
+        await atlassianDelete({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/2/issue/${encodeURIComponent(issueKey)}/worklog/${encodeURIComponent(worklogId)}`,
+        });
+        return { id: worklogId, deleted: true };
+    }
+    /** Lists the users watching an issue. */
+    async listWatchers(issueKey: string): Promise<JiraWatcher[]> {
+        const response = await atlassianGet({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/2/issue/${encodeURIComponent(issueKey)}/watchers`,
+        });
+        return (response.watchers || []).map((watcher: any) => ({
+            name: watcher.name || "",
+            displayName: watcher.displayName || watcher.name || "Unknown",
+            active: watcher.active !== false,
+        }));
+    }
+    /**
+     * Adds a watcher. Jira expects the bare username as a JSON string body
+     * here, not an object — an unusual shape for this API.
+     */
+    async addWatcher(issueKey: string, username: string): Promise<JiraWatcherResult> {
+        await atlassianPost({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/2/issue/${encodeURIComponent(issueKey)}/watchers`,
+            body: username,
+        });
+        return { issueKey, username, watching: true };
+    }
+    async removeWatcher(issueKey: string, username: string): Promise<JiraWatcherResult> {
+        await atlassianDelete({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/2/issue/${encodeURIComponent(issueKey)}/watchers`,
+            query: { username },
+        });
+        return { issueKey, username, watching: false };
+    }
     async addWorklog(issueKey: string, options: JiraAddWorklogOptions): Promise<JiraWorklogResult> {
         const body: Record<string, any> = { timeSpent: options.timeSpent };
         if (options.comment !== undefined) {
