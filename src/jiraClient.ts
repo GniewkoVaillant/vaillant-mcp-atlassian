@@ -5,13 +5,20 @@
  * and transitioning issues between statuses.
  */
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { basename, dirname, isAbsolute } from "node:path";
+import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
 import { atlassianDelete, atlassianGet, atlassianGetBinary, atlassianPost, atlassianPostFormData, atlassianPut, AtlassianHttpError, } from "./httpClient.js";
 import { decodeProformaDesign, formatProformaAnswer, getProformaChunkCount, } from "./proforma.js";
 
 export interface ClientOptions {
     baseUrl: string;
     pat: string;
+    /**
+     * Absolute directories that attachment download/upload may touch. An empty
+     * or omitted list disables filesystem access entirely, which is the safe
+     * default: issue content is written by other people, so a crafted ticket
+     * must not be able to talk the agent into reading arbitrary local files.
+     */
+    attachmentDirs?: string[];
 }
 
 export interface JiraIssueSummary {
@@ -303,6 +310,36 @@ export class JiraClient {
     constructor(options: ClientOptions) {
         this.options = options;
     }
+    /**
+     * Rejects any attachment path outside the configured allowlist. Paths are
+     * resolved first so that `..` segments and symlink-style traversal cannot
+     * escape an allowed directory.
+     */
+    private assertAttachmentPathAllowed(candidate: string, label: string): string {
+        if (!isAbsolute(candidate)) {
+            throw new Error(`Attachment ${label} must be an absolute path`);
+        }
+        const allowed = this.options.attachmentDirs ?? [];
+        if (allowed.length === 0) {
+            throw new Error(
+                "Attachment access is disabled. Set ATLASSIAN_ATTACHMENT_DIRS to a " +
+                    "colon-separated list of directories to enable it.",
+            );
+        }
+        const resolved = resolve(candidate);
+        const permitted = allowed.some((dir) => {
+            const root = resolve(dir);
+            const rel = relative(root, resolved);
+            return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+        });
+        if (!permitted) {
+            throw new Error(
+                `Attachment ${label} "${resolved}" is outside the allowed directories ` +
+                    `(${allowed.join(", ")}).`,
+            );
+        }
+        return resolved;
+    }
     async searchIssues(jql: string, maxResults = 20): Promise<JiraIssueSummary[]> {
         const data = await atlassianGet({
             baseUrl: this.options.baseUrl,
@@ -491,9 +528,7 @@ export class JiraClient {
         }));
     }
     async downloadAttachment(attachmentId: string, outputPath: string): Promise<JiraAttachmentDownloadResult> {
-        if (!isAbsolute(outputPath)) {
-            throw new Error("Attachment outputPath must be an absolute path");
-        }
+        const safeOutputPath = this.assertAttachmentPathAllowed(outputPath, "outputPath");
         const metadata = await atlassianGet({
             baseUrl: this.options.baseUrl,
             pat: this.options.pat,
@@ -507,22 +542,20 @@ export class JiraClient {
             pat: this.options.pat,
             path: metadata.content,
         });
-        await mkdir(dirname(outputPath), { recursive: true });
-        await writeFile(outputPath, response.data);
+        await mkdir(dirname(safeOutputPath), { recursive: true });
+        await writeFile(safeOutputPath, response.data);
         return {
             id: attachmentId,
-            outputPath,
+            outputPath: safeOutputPath,
             bytesWritten: response.data.byteLength,
             contentType: response.contentType,
         };
     }
     async uploadAttachment(issueKey: string, filePath: string, mimeType = "application/octet-stream"): Promise<JiraAttachmentSummary[]> {
-        if (!isAbsolute(filePath)) {
-            throw new Error("Attachment filePath must be an absolute path");
-        }
-        const data = await readFile(filePath);
+        const safeFilePath = this.assertAttachmentPathAllowed(filePath, "filePath");
+        const data = await readFile(safeFilePath);
         const form = new FormData();
-        form.append("file", new Blob([data], { type: mimeType }), basename(filePath));
+        form.append("file", new Blob([data], { type: mimeType }), basename(safeFilePath));
         const uploaded = await atlassianPostFormData({
             baseUrl: this.options.baseUrl,
             pat: this.options.pat,
@@ -531,7 +564,7 @@ export class JiraClient {
         });
         return uploaded.map((attachment: any) => ({
             id: attachment.id,
-            filename: attachment.filename || basename(filePath),
+            filename: attachment.filename || basename(safeFilePath),
             author: userLabel(attachment.author),
             created: attachment.created || "",
             size: attachment.size || data.byteLength,

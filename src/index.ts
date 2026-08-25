@@ -9,14 +9,15 @@
  *
  * Transport: stdio.
  */
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, type ToolCallback } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import type { ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { loadConfig } from "./config.js";
+import { loadConfig, type ToolGroup } from "./config.js";
 import { JiraClient } from "./jiraClient.js";
 import { JiraAgileClient } from "./jiraAgileClient.js";
 import { ConfluenceClient } from "./confluenceClient.js";
-import { AtlassianHttpError } from "./httpClient.js";
+import { AtlassianHttpError, configureHttp } from "./httpClient.js";
 /** Formats any thrown error into a concise, user-facing message string. */
 function formatError(error: unknown): string {
     if (error instanceof AtlassianHttpError) {
@@ -27,9 +28,23 @@ function formatError(error: unknown): string {
     }
     return String(error);
 }
+/**
+ * How a tool affects the world, used to derive MCP annotations:
+ *  - "read"        never modifies anything
+ *  - "write"       creates or updates, and is reversible
+ *  - "destructive" removes data or is otherwise hard to undo
+ * "local" additionally marks tools that touch the local filesystem rather
+ * than (or as well as) the remote Atlassian instance.
+ */
+type ToolKind = "read" | "write" | "destructive" | "local";
 async function main() {
     const config = loadConfig();
-    const jiraClient = new JiraClient({ baseUrl: config.jiraBaseUrl, pat: config.jiraPat });
+    configureHttp({ timeoutMs: config.timeoutMs });
+    const jiraClient = new JiraClient({
+        baseUrl: config.jiraBaseUrl,
+        pat: config.jiraPat,
+        attachmentDirs: config.attachmentDirs,
+    });
     const jiraAgileClient = new JiraAgileClient({ baseUrl: config.jiraBaseUrl, pat: config.jiraPat });
     const confluenceClient = new ConfluenceClient({
         baseUrl: config.confluenceBaseUrl,
@@ -37,9 +52,48 @@ async function main() {
     });
     const server = new McpServer({
         name: "mcp-atlassian",
-        version: "1.0.0",
+        version: "1.1.0",
     });
-    server.registerTool("jira_search_issues", {
+    const registered: string[] = [];
+    /**
+     * Registers a tool, but only when its group is enabled by the active
+     * profile and — for mutating tools — when the server is not in read-only
+     * mode. Attaches MCP annotations so clients can tell a lookup apart from a
+     * deletion without parsing the prose description.
+     */
+    function tool<InputArgs extends z.ZodRawShape>(
+        group: ToolGroup,
+        kind: ToolKind,
+        name: string,
+        spec: {
+            title?: string;
+            description?: string;
+            inputSchema?: InputArgs;
+            annotations?: ToolAnnotations;
+        },
+        handler: ToolCallback<InputArgs>,
+    ): void {
+        if (!config.enabledGroups.has(group)) return;
+        if (config.readOnly && kind !== "read") return;
+        server.registerTool<z.ZodRawShape, InputArgs>(
+            name,
+            {
+                ...spec,
+                annotations: {
+                    ...spec.annotations,
+                    readOnlyHint: kind === "read",
+                    destructiveHint: kind === "destructive",
+                    // Re-running a read or a delete converges on the same state;
+                    // re-running a create does not.
+                    idempotentHint: kind === "read" || kind === "destructive",
+                    openWorldHint: kind !== "local",
+                },
+            },
+            handler,
+        );
+        registered.push(name);
+    }
+    tool("core", "read", "jira_search_issues", {
         title: "Search Jira issues",
         description: "Search Jira Data Center issues using JQL (Jira Query Language). " +
             "Returns key, summary, status, assignee, issue type, and priority for each matching issue. Read-only.",
@@ -74,7 +128,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("jira_get_issue", {
+    tool("core", "read", "jira_get_issue", {
         title: "Get Jira issue",
         description: "Get full details of a single Jira Data Center issue by key, including summary, description, " +
             "status, assignee, reporter, comments, and created/updated dates. Read-only.",
@@ -95,7 +149,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("jira_get_issue_fields", {
+    tool("core", "read", "jira_get_issue_fields", {
         title: "Get named Jira issue fields",
         description: "Get named standard and custom field values for a Jira Data Center issue. Useful for PPM " +
             "and other projects whose important data lives in custom fields. By default returns all " +
@@ -124,7 +178,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("jira_list_proforma_forms", {
+    tool("forms", "read", "jira_list_proforma_forms", {
         title: "List Jira ProForma forms",
         description: "List Forms (ProForma) attached to a Jira Data Center issue, including IDs, names, " +
             "submission state, and timestamps. Reads standard Jira issue properties; no separate " +
@@ -153,7 +207,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("jira_get_proforma_form", {
+    tool("forms", "read", "jira_get_proforma_form", {
         title: "Get Jira ProForma form",
         description: "Decode one Forms (ProForma) form attached to a Jira issue and return readable question " +
             "labels, selected choice labels, answers, and completion counts. Read-only.",
@@ -179,7 +233,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("jira_get_proforma_forms_summary", {
+    tool("forms", "read", "jira_get_proforma_forms_summary", {
         title: "Get all Jira ProForma forms",
         description: "Decode all Forms (ProForma) forms attached to a Jira issue into readable question and " +
             "answer data. Best for completeness audits of PPM requests. Read-only.",
@@ -214,7 +268,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("jira_list_attachments", {
+    tool("files", "read", "jira_list_attachments", {
         title: "List Jira attachments",
         description: "List attachment metadata for a Jira issue, including IDs, filenames, authors, sizes, MIME " +
             "types, and download URLs. Read-only.",
@@ -242,7 +296,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("jira_download_attachment", {
+    tool("files", "local", "jira_download_attachment", {
         title: "Download Jira attachment",
         description: "Download a Jira attachment to an explicit absolute path on the local machine. Writes a " +
             "local file but does not modify Jira.",
@@ -264,7 +318,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("jira_upload_attachment", {
+    tool("files", "local", "jira_upload_attachment", {
         title: "Upload Jira attachment",
         description: "Upload a local file as an attachment to a Jira issue. Mutates data: creates a real " +
             "attachment on the issue.",
@@ -288,7 +342,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("jira_delete_attachment", {
+    tool("files", "destructive", "jira_delete_attachment", {
         title: "Delete Jira attachment",
         description: "Permanently delete a Jira attachment by ID. Mutates data and cannot be undone.",
         inputSchema: {
@@ -306,7 +360,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("jira_list_issue_link_types", {
+    tool("links", "read", "jira_list_issue_link_types", {
         title: "List Jira issue link types",
         description: "List the configured Jira issue-link types and their inward/outward descriptions. Read-only.",
         inputSchema: {},
@@ -324,7 +378,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("jira_get_issue_links", {
+    tool("links", "read", "jira_get_issue_links", {
         title: "Get Jira issue links",
         description: "Get all inward and outward issue links for a Jira issue, including relationship, linked " +
             "issue summary, and status. Read-only.",
@@ -350,7 +404,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("jira_create_issue_link", {
+    tool("links", "write", "jira_create_issue_link", {
         title: "Create Jira issue link",
         description: "Create a relationship between two Jira issues using a configured link type. Mutates data " +
             "and optionally adds a comment.",
@@ -374,7 +428,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("jira_delete_issue_link", {
+    tool("links", "destructive", "jira_delete_issue_link", {
         title: "Delete Jira issue link",
         description: "Delete a Jira issue link by its link ID. Mutates data and cannot be undone.",
         inputSchema: {
@@ -392,7 +446,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("jira_create_issue", {
+    tool("write", "write", "jira_create_issue", {
         title: "Create Jira issue",
         description: "Create a new Jira Data Center issue or sub-task. Mutates data: sends a POST request that " +
             "creates a real issue in the target project.",
@@ -432,7 +486,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("jira_update_issue", {
+    tool("write", "write", "jira_update_issue", {
         title: "Update Jira issue",
         description: "Update fields on an existing Jira Data Center issue by key. Mutates data: sends a PUT request " +
             "that changes the real issue. Supports common named fields plus a flexible 'fields' object " +
@@ -470,7 +524,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("jira_add_comment", {
+    tool("write", "write", "jira_add_comment", {
         title: "Add Jira comment",
         description: "Add a comment to an existing Jira Data Center issue by key. Mutates data: sends a POST " +
             "request that adds a real comment.",
@@ -492,7 +546,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("jira_edit_comment", {
+    tool("write", "write", "jira_edit_comment", {
         title: "Edit Jira comment",
         description: "Edit an existing comment on a Jira Data Center issue. Mutates data: sends a PUT " +
             "request that edits a real comment. Note: Jira typically only allows editing your " +
@@ -517,7 +571,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("jira_delete_comment", {
+    tool("write", "destructive", "jira_delete_comment", {
         title: "Delete Jira comment",
         description: "Delete an existing comment from a Jira Data Center issue. Mutates data: sends a " +
             "DELETE request that permanently removes a real comment. This cannot be undone. " +
@@ -541,7 +595,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("jira_add_worklog", {
+    tool("write", "write", "jira_add_worklog", {
         title: "Log work on a Jira issue",
         description: "Log work (a worklog entry) against an existing Jira Data Center issue by key. Mutates data: " +
             "sends a POST request that adds a real worklog entry, including the time spent and an " +
@@ -571,7 +625,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("jira_add_worklog_with_category", {
+    tool("write", "write", "jira_add_worklog_with_category", {
         title: "Log work on a Jira issue with a work category (vaillant-timetracking plugin)",
         description: "Log work against an existing Jira Data Center issue through the vaillant-timetracking " +
             "plugin's own REST endpoint, including a work category (e.g. 'cat1', 'cat2'). Unlike " +
@@ -615,7 +669,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("jira_transition_issue", {
+    tool("write", "write", "jira_transition_issue", {
         title: "Transition Jira issue status",
         description: "Transition a Jira Data Center issue to a new status by name (case-insensitive). Mutates data: " +
             "looks up available transitions, then sends a POST request that changes the real issue's " +
@@ -643,7 +697,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("jira_get_issue_changelog", {
+    tool("dev", "read", "jira_get_issue_changelog", {
         title: "Get Jira issue status changelog",
         description: "Get the full status transition history (from/to/when/who) for a single Jira Data Center " +
             "issue, fetched from the dedicated paginated changelog endpoint (not capped like the " +
@@ -667,7 +721,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("jira_get_issue_cycle_time", {
+    tool("dev", "read", "jira_get_issue_cycle_time", {
         title: "Get Jira issue cycle time",
         description: "Compute cycle time in days for one or more Jira Data Center issues, based on real " +
             "status-transition history (not the created/updated proxy dates, which are misleading " +
@@ -707,7 +761,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("jira_get_issue_dev_status", {
+    tool("dev", "read", "jira_get_issue_dev_status", {
         title: "Get Jira issue development status",
         description: "Get a single Jira Data Center issue's linked GitHub development activity (from Jira's " +
             "'Development' panel): branches, pull requests, and commits, including full commit " +
@@ -733,7 +787,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("jira_get_issues_dev_status", {
+    tool("dev", "read", "jira_get_issues_dev_status", {
         title: "Get Jira issues development status (batch)",
         description: "Batch version of jira_get_issue_dev_status: get linked GitHub branches, pull requests, " +
             "and commits (with full messages, for 'Co-authored-by:' detection) for multiple Jira Data " +
@@ -762,7 +816,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("jira_get_issues_story_points", {
+    tool("agile", "read", "jira_get_issues_story_points", {
         title: "Get story points for Jira issues",
         description: "Get story points for a list of Jira issues by key, on either Scrum or Kanban boards " +
             "(Data Center). Discovers the board's configured estimation field via its board " +
@@ -814,7 +868,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("jira_get_board_sprints", {
+    tool("agile", "read", "jira_get_board_sprints", {
         title: "List sprints for a Jira board",
         description: "List sprints for a Jira Agile board (Data Center). Returns sprint id, name, state, " +
             "startDate, endDate, and goal for each sprint. Read-only.",
@@ -846,7 +900,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("jira_get_sprint_report", {
+    tool("agile", "read", "jira_get_sprint_report", {
         title: "Get Jira sprint completion/velocity report",
         description: "Get an approximate velocity/completion report for a single sprint on a Jira Agile board " +
             "(Data Center). Dynamically discovers the board's configured story points field via its " +
@@ -873,7 +927,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("jira_get_board_velocity", {
+    tool("agile", "read", "jira_get_board_velocity", {
         title: "Get Jira board velocity report",
         description: "Get a velocity summary across the most recently closed sprints on a Jira Agile board " +
             "(Data Center): sprint name, dates, committed points, completed points, and completion " +
@@ -905,7 +959,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("confluence_search_pages", {
+    tool("core", "read", "confluence_search_pages", {
         title: "Search Confluence pages",
         description: "Search Confluence Data Center content using CQL (Confluence Query Language). " +
             "Returns id, title, space, and URL for each matching page. Read-only.",
@@ -944,7 +998,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("confluence_get_page", {
+    tool("core", "read", "confluence_get_page", {
         title: "Get Confluence page",
         description: "Get a Confluence Data Center page's content by its page ID. Storage-format HTML is converted " +
             "to plain text where reasonably possible. Read-only.",
@@ -965,7 +1019,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("confluence_list_comments", {
+    tool("core", "read", "confluence_list_comments", {
         title: "List Confluence comments",
         description: "List comments on a Confluence Data Center page, including comment IDs, authors, creation " +
             "dates, versions, and readable bodies. Read-only.",
@@ -1000,7 +1054,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("confluence_add_comment", {
+    tool("write", "write", "confluence_add_comment", {
         title: "Add Confluence comment",
         description: "Add a comment to a Confluence Data Center page. Mutates data by creating a real comment. " +
             "Body may be plain text or simple storage-compatible HTML.",
@@ -1020,7 +1074,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("confluence_update_comment", {
+    tool("write", "write", "confluence_update_comment", {
         title: "Update Confluence comment",
         description: "Update an existing Confluence comment by ID. Mutates data and increments the comment's " +
             "content version.",
@@ -1042,7 +1096,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("confluence_delete_comment", {
+    tool("write", "destructive", "confluence_delete_comment", {
         title: "Delete Confluence comment",
         description: "Permanently delete a Confluence comment by ID. Mutates data and cannot be undone.",
         inputSchema: {
@@ -1062,7 +1116,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("confluence_create_page", {
+    tool("write", "write", "confluence_create_page", {
         title: "Create Confluence page",
         description: "Create a new Confluence Data Center page. Mutates data: sends a POST request that creates a " +
             "real page. Body may be plain text or simple HTML; plain text is automatically wrapped into " +
@@ -1094,7 +1148,7 @@ async function main() {
             };
         }
     });
-    server.registerTool("confluence_update_page", {
+    tool("write", "write", "confluence_update_page", {
         title: "Update Confluence page",
         description: "Update an existing Confluence Data Center page's title and/or content by page ID. Mutates " +
             "data: fetches the current page to read its version number, then sends a PUT request with " +
@@ -1127,8 +1181,17 @@ async function main() {
     });
     const transport = new StdioServerTransport();
     await server.connect(transport);
-    // eslint-disable-next-line no-console
-    console.error("mcp-atlassian server started (stdio transport). Jira/Confluence read and write tools ready.");
+    // stdout carries the JSON-RPC stream, so all diagnostics go to stderr.
+    // Report the resolved surface: without it, a profile typo silently hides
+    // tools and looks like a client bug.
+    const profile = process.env.ATLASSIAN_PROFILE?.trim() || "full";
+    const groups = [...config.enabledGroups].sort().join(", ");
+    console.error(
+        `mcp-atlassian started (stdio). profile=${profile} groups=[${groups}] ` +
+            `tools=${registered.length}${config.readOnly ? " READ-ONLY" : ""} ` +
+            `attachments=${config.attachmentDirs.length > 0 ? config.attachmentDirs.join(":") : "disabled"} ` +
+            `timeout=${config.timeoutMs}ms`,
+    );
 }
 main().catch((error) => {
     // Startup errors (e.g. missing env vars) should be clear and fatal.
