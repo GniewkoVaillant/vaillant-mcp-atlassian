@@ -177,6 +177,36 @@ try {
     });
     const confluenceResult = toolText(confluence);
     check("confluence_search_pages", confluenceResult.ok, confluenceResult.text.slice(0, 200));
+
+    // Optional, read-only issue-field and ProForma checks. Opt-in via a
+    // disposable/known test issue rather than a hard-coded key, so this
+    // script never assumes a specific production ticket exists.
+    const smokeIssue = process.env.ATLASSIAN_SMOKE_JIRA_ISSUE?.trim();
+    if (smokeIssue) {
+      const issueFields = await request("tools/call", {
+        name: "jira_get_issue_fields",
+        arguments: { issueKey: smokeIssue },
+      });
+      const issueFieldsResult = toolText(issueFields);
+      check(
+        `jira_get_issue_fields (${smokeIssue}, no fieldNames)`,
+        issueFieldsResult.ok,
+        issueFieldsResult.text.slice(0, 200),
+      );
+
+      const proformaSummary = await request("tools/call", {
+        name: "jira_get_proforma_forms_summary",
+        arguments: { issueKey: smokeIssue },
+      });
+      const proformaSummaryResult = toolText(proformaSummary);
+      check(
+        `jira_get_proforma_forms_summary (${smokeIssue})`,
+        proformaSummaryResult.ok,
+        proformaSummaryResult.text.slice(0, 200),
+      );
+    } else {
+      console.log("  skip  set ATLASSIAN_SMOKE_JIRA_ISSUE to also exercise jira_get_issue_fields / ProForma reads");
+    }
   } else {
     console.log("live read-only calls");
     console.log(

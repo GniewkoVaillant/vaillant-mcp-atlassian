@@ -13,7 +13,7 @@ import {
     writeNewAttachment,
 } from "./attachmentSecurity.js";
 import { atlassianDelete, atlassianGet, atlassianGetBinary, atlassianPost, atlassianPostFormData, atlassianPut, AtlassianHttpError, } from "./httpClient.js";
-import { decodeProformaDesign, formatProformaAnswer, getProformaChunkCount, } from "./proforma.js";
+import { decodeProformaDesign, formatProformaAnswer, getProformaChunkCount, getProformaJiraFieldId, } from "./proforma.js";
 import { DEFAULT_CONCURRENCY, mapWithConcurrency } from "./concurrency.js";
 import { fetchPaginatedJiraValues, resolveMaxPaginationPages } from "./jiraPagination.js";
 import { describeUpstreamValue, requireUpstreamArray, requireUpstreamObject } from "./upstreamShape.js";
@@ -180,6 +180,12 @@ export interface JiraProformaAnswer {
     type: string;
     answer: string;
     rawAnswer: any;
+    /**
+     * Where this answer came from: the browser-only form state, or a Jira
+     * field linked via the question's `jiraField` mapping. A meaningful
+     * form-state answer always wins over a linked field (REQ-005).
+     */
+    source: "form-state" | "jira-field";
 }
 
 export interface JiraProformaForm extends JiraProformaFormSummary {
@@ -187,6 +193,12 @@ export interface JiraProformaForm extends JiraProformaFormSummary {
     answeredQuestions: number;
     totalQuestions: number;
     answers: JiraProformaAnswer[];
+    /**
+     * Caller-facing caveats about this read - currently just the open-form
+     * notice that unsaved browser-only edits are invisible to the server API.
+     * Empty for submitted forms.
+     */
+    warnings: string[];
 }
 
 export interface JiraAttachmentSummary {
@@ -720,22 +732,43 @@ export class JiraClient {
         // Field entries without a usable id cannot be requested or read back,
         // and a missing `name` must not take the whole lookup down with it.
         const usable = definitions.filter((field: any) => field && typeof field.id === "string");
+        const byId = new Map(usable.map((field: any) => [field.id, field]));
         const requested = new Set(fieldNames.map((name) => name.toLocaleLowerCase()));
-        const selected = requested.size === 0
-            ? usable.filter((field: any) => !["attachment", "comment", "worklog"].includes(field.id))
-            : usable.filter((field: any) => requested.has(field.id.toLocaleLowerCase()) ||
+
+        // `selectedIds` is only set for the named-field path, where the query
+        // string stays short. When no names are given we ask Jira for every
+        // field via the constant-length negative selector below instead of
+        // concatenating the whole instance-wide catalogue into the URL - some
+        // Data Center instances carry thousands of custom fields, and that
+        // concatenation produced request URLs long enough to be rejected
+        // upstream.
+        let selectedIds: string[] | null = null;
+        if (requested.size > 0) {
+            const matched = usable.filter((field: any) => requested.has(field.id.toLocaleLowerCase()) ||
                 requested.has(String(field.name ?? "").toLocaleLowerCase()));
-        if (requested.size > 0 && selected.length === 0) {
-            throw new Error(`No Jira fields matched: ${fieldNames.join(", ")}`);
+            if (matched.length === 0) {
+                throw new Error(`No Jira fields matched: ${fieldNames.join(", ")}`);
+            }
+            selectedIds = matched.map((field: any) => field.id);
         }
+
         const issue = await atlassianGet({
             baseUrl: this.options.baseUrl,
             pat: this.options.pat,
             path: `/rest/api/2/issue/${encodeURIComponent(issueKey)}`,
-            query: { fields: selected.map((field: any) => field.id).join(",") },
+            query: { fields: selectedIds ? selectedIds.join(",") : "*all,-attachment,-comment,-worklog" },
         });
         const issueFields = requireIssueFields(issue, issueKey);
-        return selected
+        // For the *all path, the candidate list comes from what Jira actually
+        // returned rather than from the local catalogue, so a field missing
+        // from `getFieldDefinitions()` (a lag between the two endpoints)
+        // still surfaces instead of silently vanishing; the exclusion is
+        // reasserted defensively in case a Data Center version ignores the
+        // negative selector.
+        const candidateIds = selectedIds ??
+            Object.keys(issueFields).filter((id) => id !== "attachment" && id !== "comment" && id !== "worklog");
+        return candidateIds
+            .map((id) => byId.get(id) ?? { id, name: id, custom: false })
             .filter((field: any) => includeEmpty || hasFieldValue(issueFields[field.id]))
             .map((field: any) => ({
             id: field.id,
@@ -812,7 +845,7 @@ export class JiraClient {
             (index) => this.getIssueProperty(issueKey, `${propertyKey}.${index}`),
         );
         const design = decodeProformaDesign(root, additionalChunks);
-        const questions = design?.questions && typeof design.questions === "object" && !Array.isArray(design.questions)
+        const questions: Record<string, any> = design?.questions && typeof design.questions === "object" && !Array.isArray(design.questions)
             ? design.questions
             : {};
         const stateAnswers = root.state?.answers ?? {};
@@ -821,30 +854,96 @@ export class JiraClient {
                 `answers in "${propertyKey}": expected an object, received ${describeUpstreamValue(stateAnswers)}.`);
         }
         const rawStatus = root.state?.status;
-        const answers = Object.entries(stateAnswers)
-            .map(([questionId, rawAnswer]) => {
+        const status = rawStatus === "s"
+            ? "submitted"
+            : rawStatus === "o"
+                ? "open"
+                : rawStatus || (metadata.submitted ? "submitted" : "open");
+
+        const hasMeaningfulStateAnswer = (questionId: string): boolean =>
+            Object.prototype.hasOwnProperty.call(stateAnswers, questionId) &&
+            formatProformaAnswer(stateAnswers[questionId], questions[questionId]) !== "";
+
+        // Questions mapped to a Jira field (`design.questions[id].jiraField`)
+        // can carry a value already persisted on the issue even when the
+        // browser-only form state has no meaningful answer for them yet, or
+        // omits the question entirely. Never resolve a question the form
+        // state already answers meaningfully (REQ-005).
+        const jiraFieldByQuestion = new Map<string, string>();
+        for (const [questionId, question] of Object.entries(questions)) {
+            if (hasMeaningfulStateAnswer(questionId))
+                continue;
+            const fieldId = getProformaJiraFieldId(question);
+            if (fieldId)
+                jiraFieldByQuestion.set(questionId, fieldId);
+        }
+
+        let linkedFieldValues = new Map<string, any>();
+        if (jiraFieldByQuestion.size > 0) {
+            const uniqueFieldIds = Array.from(new Set(jiraFieldByQuestion.values()));
+            let linkedFields: JiraIssueFieldValue[];
+            try {
+                linkedFields = await this.getIssueFields(issueKey, uniqueFieldIds, true);
+            }
+            catch (error) {
+                const cause = error instanceof Error ? error.message : String(error);
+                throw new Error(`ProForma form ${formId} ("${metadata.name}") on issue ${issueKey} could not ` +
+                    `resolve linked Jira field(s) ${uniqueFieldIds.join(", ")}: ${cause}`);
+            }
+            linkedFieldValues = new Map(linkedFields.map((field) => [field.id, field.value]));
+        }
+
+        // The merged question set is every question the form state answers
+        // plus every question resolved above - a superset of `stateAnswers`'
+        // keys whenever a Jira-backed question is absent from form state
+        // entirely (REQ-004). `totalQuestions` below follows this set rather
+        // than `stateAnswers` alone so the count stays accurate once linked
+        // answers are merged in.
+        const questionIds = new Set<string>([...Object.keys(stateAnswers), ...jiraFieldByQuestion.keys()]);
+        const answers = Array.from(questionIds)
+            .map((questionId) => {
             const question = questions[questionId];
+            const label = question?.label?.trim() || `Question ${questionId}`;
+            const type = question?.type || "unknown";
+            const fieldId = jiraFieldByQuestion.get(questionId);
+            if (fieldId !== undefined) {
+                const fieldValue = linkedFieldValues.get(fieldId);
+                if (hasFieldValue(fieldValue)) {
+                    return {
+                        questionId,
+                        label,
+                        type,
+                        answer: formatProformaAnswer(fieldValue, question),
+                        rawAnswer: fieldValue,
+                        source: "jira-field" as const,
+                    };
+                }
+            }
+            const rawAnswer = stateAnswers[questionId];
             return {
                 questionId,
-                label: question?.label?.trim() || `Question ${questionId}`,
-                type: question?.type || "unknown",
+                label,
+                type,
                 answer: formatProformaAnswer(rawAnswer, question),
                 rawAnswer,
+                source: "form-state" as const,
             };
         })
             .filter((answer) => includeEmpty || answer.answer !== "");
+        // Open forms can still change in the browser before the person saves;
+        // a server-side read can never see those unsaved edits (CON-002), so
+        // every open-form read carries that caveat explicitly instead of
+        // silently looking complete.
+        const warnings: string[] = status === "open"
+            ? ["Open form: unsaved browser-only changes are not visible through Jira server APIs."]
+            : [];
         return {
             ...metadata,
-            status: rawStatus === "s"
-                ? "submitted"
-                : rawStatus === "o"
-                    ? "open"
-                    : rawStatus || (metadata.submitted ? "submitted" : "open"),
+            status,
             answeredQuestions: answers.filter((answer) => answer.answer !== "").length,
-            totalQuestions: Object.keys(stateAnswers).length > 0
-                ? Object.keys(stateAnswers).length
-                : Object.keys(questions).length,
+            totalQuestions: questionIds.size > 0 ? questionIds.size : Object.keys(questions).length,
             answers,
+            warnings,
         };
     }
     async getProformaFormsSummary(issueKey: string, includeEmpty = false): Promise<JiraProformaForm[]> {

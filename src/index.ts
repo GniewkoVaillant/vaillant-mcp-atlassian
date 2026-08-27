@@ -408,7 +408,11 @@ async function main() {
     tool("forms", "read", "jira_get_proforma_form", {
         title: "Get Jira ProForma form",
         description: "Decode one Forms (ProForma) form attached to a Jira issue and return readable question " +
-            "labels, selected choice labels, answers, and completion counts. Read-only.",
+            "labels, selected choice labels, answers, and completion counts. Each answer's \"source\" is " +
+            "\"form-state\" or \"jira-field\": a question mapped to a Jira field is resolved from that " +
+            "persisted field when the form state has no meaningful answer for it. Unsaved browser-only edits on " +
+            "an open form are never visible through this API; open-form reads carry a warning saying so. " +
+            "Read-only.",
         inputSchema: {
             issueKey: issueKeySchema.describe("Jira issue key, e.g. 'PPM-21345'"),
             formId: z.number().int().positive().describe("Form ID returned by jira_list_proforma_forms"),
@@ -434,7 +438,11 @@ async function main() {
     tool("forms", "read", "jira_get_proforma_forms_summary", {
         title: "Get all Jira ProForma forms",
         description: "Decode all Forms (ProForma) forms attached to a Jira issue into readable question and " +
-            "answer data. Best for completeness audits of PPM requests. Read-only.",
+            "answer data. Best for completeness audits of PPM requests. Each answer's \"source\" is " +
+            "\"form-state\" or \"jira-field\": a question mapped to a Jira field is resolved from that " +
+            "persisted field when the form state has no meaningful answer for it. Unsaved browser-only edits on " +
+            "an open form are never visible through this API; open-form reads carry a warning saying so. " +
+            "Read-only.",
         inputSchema: {
             issueKey: issueKeySchema.describe("Jira issue key, e.g. 'PPM-21345'"),
             includeEmpty: z

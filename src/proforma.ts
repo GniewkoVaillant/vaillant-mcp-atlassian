@@ -69,6 +69,27 @@ function parseChunkPosition(part: string): ProformaChunkPosition {
     }
     return { current, total };
 }
+/**
+ * Extracts a ProForma question's mapped Jira field ID, if any.
+ *
+ * Some form questions are configured (via `design.questions[id].jiraField`)
+ * to mirror a Jira custom field, so a value already persisted on the issue
+ * can stand in for a question the browser-only form state has not recorded.
+ * Anything short of a genuinely usable field ID - a missing property, a
+ * non-string value, an array, or a blank string - returns null so the
+ * caller treats the question as unmapped instead of chasing a bogus field.
+ */
+export function getProformaJiraFieldId(question: unknown): string | null {
+    if (!question || typeof question !== "object" || Array.isArray(question)) {
+        return null;
+    }
+    const jiraField = (question as Record<string, unknown>).jiraField;
+    if (typeof jiraField !== "string") {
+        return null;
+    }
+    const trimmed = jiraField.trim();
+    return trimmed === "" ? null : trimmed;
+}
 export function getProformaChunkCount(root: ProformaRoot): number {
     assertProformaRoot(root);
     return root.rawData ? parseChunkPosition(root.rawData.part).total : 0;

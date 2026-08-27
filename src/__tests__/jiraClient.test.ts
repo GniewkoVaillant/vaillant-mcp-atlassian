@@ -11,8 +11,10 @@ import {
   assertGarbageHandled,
   constantHandler,
   domainError,
+  sendResponse,
   withStubServer,
   withTemporaryDirectory as withTemporaryDirectoryIn,
+  type ScriptedResponse,
 } from "./testServer.js";
 
 const withTemporaryDirectory = (action: (directory: string) => Promise<void>): Promise<void> =>
@@ -416,6 +418,226 @@ describe("malformed ProForma responses", () => {
   });
 });
 
+/**
+ * `design.questions[id].jiraField` maps a form question to a persisted Jira
+ * custom field. `getProformaForm` resolves that field only for questions the
+ * form state does not meaningfully answer, merging the result in without
+ * touching anything the form state already answers (REQ-004..REQ-009).
+ */
+function formAndFieldStub(options: {
+  properties: Record<string, unknown>;
+  fieldCatalogue?: Array<{ id: string; name: string; custom?: boolean }>;
+  issueFields?: Record<string, unknown>;
+  issueRequestUrls?: string[];
+  issueResponse?: ScriptedResponse;
+}): (request: IncomingMessage, response: ServerResponse) => void {
+  return (request, response) => {
+    const url = request.url || "";
+    if (url.startsWith("/rest/api/2/field")) {
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify(options.fieldCatalogue ?? []));
+      return;
+    }
+    if (url.includes("/properties/")) {
+      const property = decodeURIComponent(url.split("/properties/")[1] || "");
+      response.setHeader("content-type", "application/json");
+      if (!Object.prototype.hasOwnProperty.call(options.properties, property)) {
+        response.statusCode = 404;
+        response.end(JSON.stringify({ errorMessages: ["Property not found"] }));
+        return;
+      }
+      response.end(JSON.stringify(options.properties[property]));
+      return;
+    }
+    if (url.startsWith("/rest/api/2/issue/")) {
+      options.issueRequestUrls?.push(url);
+      if (options.issueResponse) {
+        sendResponse(response, options.issueResponse);
+        return;
+      }
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({ key: "TEST-1", fields: options.issueFields ?? {} }));
+      return;
+    }
+    response.statusCode = 404;
+    response.end("{}");
+  };
+}
+
+describe("ProForma jira-field fallback", () => {
+  test("resolves a persisted Jira value for a question absent from form state", async () => {
+    const properties = {
+      "proforma.forms": { value: { forms: [{ id: 7, name: "Scope form" }] } },
+      "proforma.forms.i7": {
+        value: {
+          design: { questions: { q1: { label: "Job size", type: "ts", jiraField: "customfield_100" } } },
+          state: { status: "o", answers: {} },
+        },
+      },
+    };
+    await withStubServer(formAndFieldStub({
+      properties,
+      fieldCatalogue: [{ id: "customfield_100", name: "Job size", custom: true }],
+      issueFields: { customfield_100: "Large project" },
+    }), async (baseUrl) => {
+      const client = new JiraClient({ baseUrl, pat: "synthetic-token" });
+      const form = await client.getProformaForm("TEST-1", 7);
+      assert.deepEqual(form.answers, [{
+        questionId: "q1",
+        label: "Job size",
+        type: "ts",
+        answer: "Large project",
+        rawAnswer: "Large project",
+        source: "jira-field",
+      }]);
+      assert.equal(form.answeredQuestions, 1);
+      assert.equal(form.totalQuestions, 1);
+    });
+  });
+
+  test("a meaningful form-state answer wins over a linked Jira field, without fetching it", async () => {
+    const properties = {
+      "proforma.forms": { value: { forms: [{ id: 7, name: "Scope form" }] } },
+      "proforma.forms.i7": {
+        value: {
+          design: { questions: { q1: { label: "Owner", type: "ts", jiraField: "customfield_200" } } },
+          state: { status: "s", answers: { q1: { text: "Alice" } } },
+        },
+      },
+    };
+    const issueRequestUrls: string[] = [];
+    await withStubServer(formAndFieldStub({
+      properties,
+      fieldCatalogue: [{ id: "customfield_200", name: "Owner", custom: true }],
+      issueFields: { customfield_200: "Bob" },
+      issueRequestUrls,
+    }), async (baseUrl) => {
+      const client = new JiraClient({ baseUrl, pat: "synthetic-token" });
+      const form = await client.getProformaForm("TEST-1", 7);
+      assert.deepEqual(form.answers, [{
+        questionId: "q1",
+        label: "Owner",
+        type: "ts",
+        answer: "Alice",
+        rawAnswer: { text: "Alice" },
+        source: "form-state",
+      }]);
+      assert.equal(issueRequestUrls.length, 0, "a meaningfully answered question must never trigger a field lookup");
+    });
+  });
+
+  test("deduplicates a Jira field shared by more than one mapped question into one request", async () => {
+    const properties = {
+      "proforma.forms": { value: { forms: [{ id: 7, name: "Shared field form" }] } },
+      "proforma.forms.i7": {
+        value: {
+          design: {
+            questions: {
+              q1: { label: "Q1", type: "ts", jiraField: "customfield_300" },
+              q2: { label: "Q2", type: "ts", jiraField: "customfield_300" },
+            },
+          },
+          state: { status: "o", answers: {} },
+        },
+      },
+    };
+    const issueRequestUrls: string[] = [];
+    await withStubServer(formAndFieldStub({
+      properties,
+      fieldCatalogue: [{ id: "customfield_300", name: "Shared", custom: true }],
+      issueFields: { customfield_300: "Shared value" },
+      issueRequestUrls,
+    }), async (baseUrl) => {
+      const client = new JiraClient({ baseUrl, pat: "synthetic-token" });
+      const form = await client.getProformaForm("TEST-1", 7);
+      assert.deepEqual(form.answers.map((answer) => [answer.questionId, answer.answer, answer.source]), [
+        ["q1", "Shared value", "jira-field"],
+        ["q2", "Shared value", "jira-field"],
+      ]);
+      assert.equal(issueRequestUrls.length, 1, `expected one deduplicated field request, observed ${issueRequestUrls.length}`);
+    });
+  });
+
+  test("includeEmpty applies after merging, once neither source has a value", async () => {
+    const properties = {
+      "proforma.forms": { value: { forms: [{ id: 7, name: "Empty field form" }] } },
+      "proforma.forms.i7": {
+        value: {
+          design: { questions: { q1: { label: "Empty field", type: "ts", jiraField: "customfield_400" } } },
+          state: { status: "o", answers: {} },
+        },
+      },
+    };
+    await withStubServer(formAndFieldStub({
+      properties,
+      fieldCatalogue: [{ id: "customfield_400", name: "Empty field", custom: true }],
+      issueFields: { customfield_400: null },
+    }), async (baseUrl) => {
+      const client = new JiraClient({ baseUrl, pat: "synthetic-token" });
+      const withoutEmpty = await client.getProformaForm("TEST-1", 7);
+      assert.deepEqual(withoutEmpty.answers, []);
+
+      const withEmpty = await client.getProformaForm("TEST-1", 7, true);
+      assert.equal(withEmpty.answers.length, 1);
+      assert.equal(withEmpty.answers[0].questionId, "q1");
+      assert.equal(withEmpty.answers[0].answer, "");
+    });
+  });
+
+  test("open forms always carry the unsaved-browser-edit warning", async () => {
+    const properties = {
+      "proforma.forms": { value: { forms: [{ id: 7, name: "Open form" }] } },
+      "proforma.forms.i7": {
+        value: { design: { questions: {} }, state: { status: "o", answers: {} } },
+      },
+    };
+    await withStubServer(formAndFieldStub({ properties }), async (baseUrl) => {
+      const client = new JiraClient({ baseUrl, pat: "synthetic-token" });
+      const form = await client.getProformaForm("TEST-1", 7);
+      assert.deepEqual(form.warnings, [
+        "Open form: unsaved browser-only changes are not visible through Jira server APIs.",
+      ]);
+    });
+  });
+
+  test("submitted forms carry no warning", async () => {
+    const properties = {
+      "proforma.forms": { value: { forms: [{ id: 7, name: "Submitted form" }] } },
+      "proforma.forms.i7": {
+        value: { design: { questions: {} }, state: { status: "s", answers: {} } },
+      },
+    };
+    await withStubServer(formAndFieldStub({ properties }), async (baseUrl) => {
+      const client = new JiraClient({ baseUrl, pat: "synthetic-token" });
+      const form = await client.getProformaForm("TEST-1", 7);
+      assert.deepEqual(form.warnings, []);
+    });
+  });
+
+  test("propagates a failed linked-field lookup with issue, form and field context", async () => {
+    const properties = {
+      "proforma.forms": { value: { forms: [{ id: 7, name: "Broken lookup form" }] } },
+      "proforma.forms.i7": {
+        value: {
+          design: { questions: { q1: { label: "Scope", type: "ts", jiraField: "customfield_500" } } },
+          state: { status: "o", answers: {} },
+        },
+      },
+    };
+    await withStubServer(formAndFieldStub({
+      properties,
+      fieldCatalogue: [{ id: "customfield_500", name: "Scope", custom: true }],
+      issueResponse: { status: 500, body: JSON.stringify({ errorMessages: ["upstream failure"] }) },
+    }), async (baseUrl) => {
+      const client = new JiraClient({ baseUrl, pat: "synthetic-token" });
+      await assert.rejects(
+        client.getProformaForm("TEST-1", 7),
+        domainError(/ProForma form 7 \("Broken lookup form"\)/, /issue TEST-1/, /customfield_500/),
+      );
+    });
+  });
+});
+
 describe("formatProformaAnswer type discrimination", () => {
   test("returns a bare string answer instead of splitting it into characters", () => {
     assert.equal(formatProformaAnswer("plain", {}), "plain");
@@ -534,6 +756,129 @@ describe("field definition cache", () => {
       const fields = await client.getIssueFields("TEST-1");
       assert.deepEqual(fields.map((field) => field.id), ["summary"]);
       assert.equal(catalogueRequests, 2, "the rejected catalogue promise must not stay in the cache");
+    });
+  });
+});
+
+describe("getIssueFields field selection", () => {
+  test("keeps the default issue request at constant length regardless of catalogue size", async () => {
+    const bigCatalogue = Array.from({ length: 2000 }, (_, index) => ({
+      id: `customfield_${index}`,
+      name: `Field ${index}`,
+      custom: true,
+    }));
+    let issueRequestUrl: string | undefined;
+    await withStubServer((request, response) => {
+      const url = request.url || "";
+      response.setHeader("content-type", "application/json");
+      if (url.startsWith("/rest/api/2/field")) {
+        response.end(JSON.stringify(bigCatalogue));
+        return;
+      }
+      issueRequestUrl = url;
+      response.end(JSON.stringify({
+        key: "TEST-1",
+        fields: {
+          customfield_1: "A value",
+          customfield_2: "",
+          attachment: [{ id: "1" }],
+          comment: { comments: [] },
+          worklog: { worklogs: [] },
+        },
+      }));
+    }, async (baseUrl) => {
+      const client = new JiraClient({ baseUrl, pat: "synthetic-token" });
+      const fields = await client.getIssueFields("TEST-1");
+
+      assert.ok(issueRequestUrl, "expected an issue request");
+      assert.equal(issueRequestUrl, "/rest/api/2/issue/TEST-1?fields=*all%2C-attachment%2C-comment%2C-worklog");
+      assert.ok(
+        (issueRequestUrl as string).length < 256,
+        `expected a bounded request URL, observed ${(issueRequestUrl as string).length} characters`,
+      );
+      assert.deepEqual(fields.map((field) => field.id), ["customfield_1"]);
+    });
+  });
+
+  test("default retrieval excludes attachment, comment and worklog and filters empty values unless includeEmpty", async () => {
+    const catalogue = [
+      { id: "customfield_1", name: "Populated", custom: true },
+      { id: "customfield_2", name: "Empty", custom: true },
+    ];
+    await withStubServer((request, response) => {
+      const url = request.url || "";
+      response.setHeader("content-type", "application/json");
+      if (url.startsWith("/rest/api/2/field")) {
+        response.end(JSON.stringify(catalogue));
+        return;
+      }
+      response.end(JSON.stringify({
+        key: "TEST-1",
+        fields: {
+          customfield_1: "A value",
+          customfield_2: "",
+          attachment: [{ id: "1" }],
+          comment: { comments: [] },
+          worklog: { worklogs: [] },
+        },
+      }));
+    }, async (baseUrl) => {
+      const client = new JiraClient({ baseUrl, pat: "synthetic-token" });
+      const fields = await client.getIssueFields("TEST-1");
+      assert.deepEqual(fields.map((field) => field.id), ["customfield_1"]);
+
+      const withEmpty = await client.getIssueFields("TEST-1", [], true);
+      assert.deepEqual(withEmpty.map((field) => field.id).sort(), ["customfield_1", "customfield_2"]);
+    });
+  });
+
+  test("exact field-name and field-ID filtering stays case-insensitive and never uses the wildcard selector", async () => {
+    const catalogue = [
+      { id: "summary", name: "Summary", custom: false },
+      { id: "customfield_10", name: "Story Points", custom: true },
+      { id: "customfield_20", name: "Epic Link", custom: true },
+    ];
+    let issueRequestUrl: string | undefined;
+    await withStubServer((request, response) => {
+      const url = request.url || "";
+      response.setHeader("content-type", "application/json");
+      if (url.startsWith("/rest/api/2/field")) {
+        response.end(JSON.stringify(catalogue));
+        return;
+      }
+      issueRequestUrl = url;
+      response.end(JSON.stringify({
+        key: "TEST-1",
+        fields: { summary: "Ticket title", customfield_10: 5 },
+      }));
+    }, async (baseUrl) => {
+      const client = new JiraClient({ baseUrl, pat: "synthetic-token" });
+      const fields = await client.getIssueFields("TEST-1", ["SUMMARY", "story points"]);
+
+      assert.ok(issueRequestUrl?.includes("fields=summary%2Ccustomfield_10"));
+      assert.ok(!issueRequestUrl?.includes("*all"), "named-field lookups must not fall back to the wildcard selector");
+      assert.deepEqual(
+        fields.map((field) => [field.id, field.value]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+        [["customfield_10", 5], ["summary", "Ticket title"]],
+      );
+    });
+  });
+
+  test("throws when no requested field name or ID matches the catalogue", async () => {
+    const catalogue = [{ id: "summary", name: "Summary", custom: false }];
+    await withStubServer((request, response) => {
+      response.setHeader("content-type", "application/json");
+      if ((request.url || "").startsWith("/rest/api/2/field")) {
+        response.end(JSON.stringify(catalogue));
+        return;
+      }
+      response.end(JSON.stringify({ key: "TEST-1", fields: {} }));
+    }, async (baseUrl) => {
+      const client = new JiraClient({ baseUrl, pat: "synthetic-token" });
+      await assert.rejects(
+        client.getIssueFields("TEST-1", ["does-not-exist"]),
+        /No Jira fields matched: does-not-exist/,
+      );
     });
   });
 });

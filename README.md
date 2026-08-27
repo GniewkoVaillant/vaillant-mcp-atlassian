@@ -94,6 +94,7 @@ appropriate only for local single-user development, never shared Azure hosting.
 | `ATLASSIAN_MAX_JSON_BYTES` | no | `16777216` | Reject a Jira/Confluence JSON response body larger than 16 MiB instead of buffering it |
 | `ATLASSIAN_MAX_TOOL_RESULT_BYTES` | no | `150000` | Truncate a tool's text result above this size, with an explicit in-band truncation marker |
 | `ATLASSIAN_SMOKE_LIVE` | no | `false` | Explicitly enable authenticated, read-only upstream smoke checks |
+| `ATLASSIAN_SMOKE_JIRA_ISSUE` | no | *(none)* | Read-only Jira issue with a ProForma form, used by `npm run test:smoke` when `ATLASSIAN_SMOKE_LIVE=true` to also exercise `jira_get_issue_fields` and `jira_get_proforma_forms_summary` |
 
 ### Tool profiles
 
@@ -224,6 +225,8 @@ destroys macros, tables and layouts; the tool's own description says so. Edit th
 storage-format HTML you intend to keep instead.
 
 **Field definitions are cached.** Jira's instance-wide field catalogue is fetched at most once every 5 minutes instead of on every `jira_get_issue_fields` call.
+
+**ProForma answer visibility.** `jira_get_proforma_form` and `jira_get_proforma_forms_summary` report each answer's `source`: `"form-state"` when the browser-only form state holds a meaningful answer, or `"jira-field"` when that question is mapped to a Jira field (`design.questions[id].jiraField`) and the form state has none. A meaningful form-state answer always wins over the linked field. `totalQuestions`/`answeredQuestions` count the merged set, so a Jira-backed question absent from form state is no longer missing from the totals. Every open-form read also carries a `warnings` entry — unsaved changes sitting only in the browser cannot be read through Jira's server APIs, so click Save in the browser before relying on a server-side read to reflect them. By default, `jira_get_issue_fields` (and the internal lookup this uses) requests fields with the constant-length selector `fields=*all,-attachment,-comment,-worklog`, so the request URL no longer grows with the size of the instance's field catalogue.
 
 **Transitions explain what they need.** `jira_get_transitions` lists the transitions available on an issue together with the fields each screen requires and their allowed values. `jira_transition_issue` accepts those via `fields`, and when one is missing it names the field and its options instead of surfacing a bare 400.
 

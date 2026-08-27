@@ -4,6 +4,7 @@ import {
   decodeProformaDesign,
   formatProformaAnswer,
   getProformaChunkCount,
+  getProformaJiraFieldId,
   type ProformaRawDataChunk,
 } from "../proforma.js";
 
@@ -112,5 +113,32 @@ describe("formatProformaAnswer", () => {
 
   test("returns an empty string when there is no meaningful answer content", () => {
     assert.equal(formatProformaAnswer({ text: " ", choices: [], empty: "", nil: null, list: [] }, {}), "");
+  });
+});
+
+describe("getProformaJiraFieldId", () => {
+  test("returns null when the question has no jiraField property", () => {
+    assert.equal(getProformaJiraFieldId({ label: "Owner" }), null);
+  });
+
+  test("returns null for a blank jiraField", () => {
+    assert.equal(getProformaJiraFieldId({ jiraField: "   " }), null);
+  });
+
+  test("returns null when jiraField is not a string", () => {
+    assert.equal(getProformaJiraFieldId({ jiraField: 12345 }), null);
+    assert.equal(getProformaJiraFieldId({ jiraField: null }), null);
+    assert.equal(getProformaJiraFieldId({ jiraField: ["customfield_1"] }), null);
+  });
+
+  test("returns null for a non-object or array question", () => {
+    assert.equal(getProformaJiraFieldId(undefined), null);
+    assert.equal(getProformaJiraFieldId(null), null);
+    assert.equal(getProformaJiraFieldId("customfield_1"), null);
+    assert.equal(getProformaJiraFieldId(["customfield_1"]), null);
+  });
+
+  test("returns the trimmed field id for a valid jiraField", () => {
+    assert.equal(getProformaJiraFieldId({ jiraField: "  customfield_20601  " }), "customfield_20601");
   });
 });

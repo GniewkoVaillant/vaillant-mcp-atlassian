@@ -1,6 +1,6 @@
 {
   "name": "mcp-atlassian",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "MCP server connecting Copilot to on-prem Jira Data Center and Confluence Data Center via Personal Access Tokens, with read and write tools.",
   "type": "module",
   "main": "dist/index.js",
