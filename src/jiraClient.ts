@@ -165,6 +165,12 @@ export interface JiraIssueFieldValue {
     value: any;
 }
 
+interface JiraFieldDefinition {
+    id: string;
+    name?: unknown;
+    custom?: boolean;
+}
+
 export interface JiraProformaFormSummary {
     id: number;
     templateId: number | null;
@@ -496,7 +502,7 @@ export class JiraClient {
      * admin edits a custom field — but get_issue_fields needs it on every call.
      * Cache it for the lifetime of a short TTL instead of refetching per call.
      */
-    private fieldDefinitions: { fetchedAt: number; fields: Promise<any[]> } | null = null;
+    private fieldDefinitions: { fetchedAt: number; fields: Promise<unknown[]> } | null = null;
     private static readonly FIELD_CACHE_TTL_MS = 5 * 60 * 1000;
     /**
      * Page budget for the one collection this client walks itself, the
@@ -508,7 +514,7 @@ export class JiraClient {
         this.options = options;
         this.maxPaginationPages = resolveMaxPaginationPages(options.maxPaginationPages);
     }
-    private async getFieldDefinitions(): Promise<any[]> {
+    private async getFieldDefinitions(): Promise<unknown[]> {
         const cached = this.fieldDefinitions;
         if (cached && Date.now() - cached.fetchedAt < JiraClient.FIELD_CACHE_TTL_MS) {
             return cached.fields;
@@ -516,7 +522,7 @@ export class JiraClient {
         // Cache the in-flight promise rather than the result: the catalogue is
         // a few hundred kilobytes on a real instance, and N concurrent callers
         // on a cold cache would otherwise each fetch their own copy.
-        const pending = (async (): Promise<any[]> => {
+        const pending = (async (): Promise<unknown[]> => {
             const fields = await atlassianGet({
                 baseUrl: this.options.baseUrl,
                 pat: this.options.pat,
@@ -731,8 +737,11 @@ export class JiraClient {
         const definitions = await this.getFieldDefinitions();
         // Field entries without a usable id cannot be requested or read back,
         // and a missing `name` must not take the whole lookup down with it.
-        const usable = definitions.filter((field: any) => field && typeof field.id === "string");
-        const byId = new Map(usable.map((field: any) => [field.id, field]));
+        const usable = definitions.filter(
+            (field): field is JiraFieldDefinition =>
+                typeof field === "object" && field !== null && "id" in field && typeof field.id === "string",
+        );
+        const byId = new Map(usable.map((field) => [field.id, field]));
         const requested = new Set(fieldNames.map((name) => name.toLocaleLowerCase()));
 
         // `selectedIds` is only set for the named-field path, where the query
@@ -744,12 +753,12 @@ export class JiraClient {
         // upstream.
         let selectedIds: string[] | null = null;
         if (requested.size > 0) {
-            const matched = usable.filter((field: any) => requested.has(field.id.toLocaleLowerCase()) ||
+            const matched = usable.filter((field) => requested.has(field.id.toLocaleLowerCase()) ||
                 requested.has(String(field.name ?? "").toLocaleLowerCase()));
             if (matched.length === 0) {
                 throw new Error(`No Jira fields matched: ${fieldNames.join(", ")}`);
             }
-            selectedIds = matched.map((field: any) => field.id);
+            selectedIds = matched.map((field) => field.id);
         }
 
         const issue = await atlassianGet({
