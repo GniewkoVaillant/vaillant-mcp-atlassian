@@ -6,6 +6,7 @@ import { readFileSync, statSync } from "node:fs";
 import { delimiter, dirname, isAbsolute, join, parse, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_MAX_ATTACHMENT_BYTES } from "./attachmentSecurity.js";
+import { DEFAULT_MAX_JSON_BYTES } from "./httpClient.js";
 
 /** Tool groups that can be enabled/disabled to control the tools/list payload. */
 export type ToolGroup = "core" | "forms" | "write" | "files" | "links" | "agile" | "dev";
@@ -56,6 +57,10 @@ export interface AtlassianConfig {
   maxQueuedRequests: number;
   /** Largest attachment accepted for upload or download. */
   maxAttachmentBytes: number;
+  /** Largest JSON response body buffered from Jira/Confluence before it is refused. */
+  maxJsonBytes: number;
+  /** Largest serialized tool result returned to the MCP client before truncation. */
+  maxToolResultBytes: number;
   /** Maximum pages automatically traversed by a Jira Agile operation. */
   maxPaginationPages: number;
 }
@@ -110,7 +115,10 @@ function loadEnvFile(): string | null {
         if (value.endsWith(quote)) value = value.slice(1, -1);
       }
 
-      if (process.env[key] === undefined || process.env[key] === "") {
+      // Only an absent variable falls back to the file. An empty value is a
+      // deliberate override ("Environment=X=" in systemd, "-e X=" in Docker) and
+      // must not be silently replaced by whatever the .env happens to contain.
+      if (process.env[key] === undefined) {
         process.env[key] = value;
       }
     }
@@ -296,6 +304,18 @@ export function loadConfig(): AtlassianConfig {
       "ATLASSIAN_MAX_ATTACHMENT_BYTES",
       DEFAULT_MAX_ATTACHMENT_BYTES,
       100 * 1024 * 1024,
+    ),
+    maxJsonBytes: parsePositiveInteger(
+      process.env.ATLASSIAN_MAX_JSON_BYTES,
+      "ATLASSIAN_MAX_JSON_BYTES",
+      DEFAULT_MAX_JSON_BYTES,
+      256 * 1024 * 1024,
+    ),
+    maxToolResultBytes: parsePositiveInteger(
+      process.env.ATLASSIAN_MAX_TOOL_RESULT_BYTES,
+      "ATLASSIAN_MAX_TOOL_RESULT_BYTES",
+      150_000,
+      16 * 1024 * 1024,
     ),
     maxPaginationPages: parsePositiveInteger(
       process.env.ATLASSIAN_MAX_PAGINATION_PAGES,

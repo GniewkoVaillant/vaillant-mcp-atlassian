@@ -27,9 +27,21 @@ export interface RequestOptions {
   path: string;
   query?: Record<string, string | number | boolean | undefined>;
   body?: unknown;
-  /** Maximum accepted binary response size, checked before and during streaming. */
+  /**
+   * Maximum accepted response size in bytes, checked against Content-Length
+   * before reading and again while streaming. Honoured by both the binary and
+   * the JSON helpers; JSON requests fall back to the ATLASSIAN_MAX_JSON_BYTES
+   * budget when this is omitted.
+   */
   maxResponseBytes?: number;
 }
+
+/**
+ * Default ceiling for a single JSON response body. Sixteen mebibytes is far
+ * above any sane Jira/Confluence REST payload yet small enough that a runaway
+ * response cannot exhaust the heap of a default Node process.
+ */
+export const DEFAULT_MAX_JSON_BYTES = 16 * 1024 * 1024;
 
 interface HttpDefaults {
   timeoutMs: number;
@@ -37,6 +49,8 @@ interface HttpDefaults {
   maxConcurrentRequests: number;
   maxQueuedRequests: number;
   maxAttempts: number;
+  /** Fallback ceiling for JSON response bodies when a caller sets no explicit budget. */
+  maxJsonBytes: number;
 }
 
 const defaults: HttpDefaults = {
@@ -45,6 +59,7 @@ const defaults: HttpDefaults = {
   maxConcurrentRequests: 4,
   maxQueuedRequests: 16,
   maxAttempts: 3,
+  maxJsonBytes: DEFAULT_MAX_JSON_BYTES,
 };
 
 interface QueuedRequest {
@@ -75,6 +90,7 @@ export function configureHttp(options: Partial<HttpDefaults>): void {
   if (options.maxConcurrentRequests !== undefined) defaults.maxConcurrentRequests = options.maxConcurrentRequests;
   if (options.maxQueuedRequests !== undefined) defaults.maxQueuedRequests = options.maxQueuedRequests;
   if (options.maxAttempts !== undefined) defaults.maxAttempts = options.maxAttempts;
+  if (options.maxJsonBytes !== undefined) defaults.maxJsonBytes = options.maxJsonBytes;
   drainQueue();
 }
 
@@ -232,12 +248,15 @@ async function fetchOnce(
       if (!location) return response;
       const next = new URL(location, url);
       if (next.origin !== new URL(options.url).origin) {
+        void response.body?.cancel().catch(() => undefined);
         throw new Error(`Refusing to follow Atlassian redirect to a different origin: ${next.origin}`);
       }
       if (options.method !== "GET") {
+        void response.body?.cancel().catch(() => undefined);
         throw new Error(`Refusing to replay a ${options.method} request after an Atlassian redirect.`);
       }
       if (redirects === 5) {
+        void response.body?.cancel().catch(() => undefined);
         throw new Error(`Request to ${options.url} exceeded the maximum of 5 same-origin redirects.`);
       }
       void response.body?.cancel().catch(() => undefined);
@@ -275,7 +294,21 @@ async function execute<T>(
   let lastError: unknown;
 
   for (let attempt = 0; attempt < defaults.maxAttempts; attempt += 1) {
-    await acquireRequestSlot(options.url, deadline, totalTimeoutMs);
+    try {
+      await acquireRequestSlot(options.url, deadline, totalTimeoutMs);
+    } catch (err) {
+      // A retry releases its slot before sleeping, so re-acquiring it can fail
+      // on a full queue. Reporting only that would hide the failure that caused
+      // the retry in the first place, which is the diagnostically useful one.
+      if (lastError !== undefined) {
+        const previous = lastError instanceof Error ? lastError : new Error(String(lastError));
+        const reason = err instanceof Error ? err.message : String(err);
+        throw new Error(`${previous.message} The retry could not be scheduled: ${reason}`, {
+          cause: previous,
+        });
+      }
+      throw err;
+    }
     let response: Response | undefined;
     let delay: number | undefined;
     try {
@@ -313,6 +346,12 @@ async function execute<T>(
 
       if (response && shouldRetry(options.method, response.status) && attempt < defaults.maxAttempts - 1) {
         delay = retryDelayMs(response, attempt);
+        lastError = new AtlassianHttpError(
+          options.url,
+          response.status,
+          response.statusText,
+          "(body discarded before retrying)",
+        );
         void response.body?.cancel().catch(() => undefined);
       } else if (response) {
         let bodyText = "";
@@ -354,11 +393,95 @@ async function execute<T>(
     : new Error(`Request to ${options.url} failed after ${defaults.maxAttempts} attempts`);
 }
 
-async function decodeJson<T>(response: Response, url: string): Promise<T> {
-  const text = await response.text();
-  if (!text) {
+/** Describes the size budget applied to one response body. */
+interface BodyLimit {
+  /** Largest accepted body size in bytes. */
+  maximum: number;
+  /** Subject named at the start of the error, e.g. "Attachment response". */
+  subject: string;
+  /** Sentence appended after the limit: which variable governs it and how to shrink the request. */
+  guidance: string;
+}
+
+function bodyTooLargeError(limit: BodyLimit, observed: number): Error {
+  return new Error(
+    `${limit.subject} size ${observed} bytes exceeds the maximum of ${limit.maximum} bytes ` +
+      `(over by ${observed - limit.maximum} bytes) ${limit.guidance}`,
+  );
+}
+
+function validateMaxResponseBytes(maximum: number | undefined): void {
+  if (maximum !== undefined && (!Number.isSafeInteger(maximum) || maximum <= 0)) {
+    throw new Error("maxResponseBytes must be a positive safe integer.");
+  }
+}
+
+/**
+ * Reads a response body into memory while enforcing a byte budget: an oversized
+ * declared Content-Length is refused before a single chunk is read, and the
+ * streaming loop aborts as soon as the actual bytes pass the limit. Every
+ * response body in this module goes through here so JSON and binary responses
+ * are bounded identically.
+ */
+async function readBoundedBody(response: Response, limit: BodyLimit): Promise<Buffer> {
+  const contentLength = response.headers.get("content-length");
+  if (contentLength !== null) {
+    const declared = Number(contentLength);
+    if (!Number.isSafeInteger(declared) || declared < 0) {
+      void response.body?.cancel().catch(() => undefined);
+      throw new Error(`${limit.subject} declared an invalid Content-Length.`);
+    }
+    if (declared > limit.maximum) {
+      void response.body?.cancel().catch(() => undefined);
+      throw bodyTooLargeError(limit, declared);
+    }
+  }
+
+  if (!response.body) return Buffer.alloc(0);
+
+  const reader = response.body.getReader();
+  const chunks: Buffer[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > limit.maximum) {
+        await reader.cancel().catch(() => undefined);
+        throw bodyTooLargeError(limit, size);
+      }
+      chunks.push(Buffer.from(value));
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks, size);
+}
+
+/** Budget applied to every JSON response, explicit per-request or process default. */
+function jsonBodyLimit(url: string, maxResponseBytes: number | undefined): BodyLimit {
+  return {
+    maximum: maxResponseBytes ?? defaults.maxJsonBytes,
+    subject: `JSON response from ${url}`,
+    guidance:
+      "configured by ATLASSIAN_MAX_JSON_BYTES. Narrow the request before retrying: ask for " +
+      "fewer results (lower maxResults/limit and paginate), request fewer fields or a smaller " +
+      "expand set, or use a more selective JQL/CQL query. Raise ATLASSIAN_MAX_JSON_BYTES only " +
+      "if the whole payload is genuinely required.",
+  };
+}
+
+async function decodeJson<T>(
+  response: Response,
+  url: string,
+  maxResponseBytes: number | undefined,
+): Promise<T> {
+  const body = await readBoundedBody(response, jsonBodyLimit(url, maxResponseBytes));
+  if (body.length === 0) {
     return undefined as T;
   }
+  const text = body.toString("utf8");
   try {
     return JSON.parse(text) as T;
   } catch {
@@ -380,13 +503,14 @@ function authHeaders(pat: string, accept: string): Record<string, string> {
  */
 export async function atlassianGet<T = any>(options: RequestOptions): Promise<T> {
   const url = buildUrl(options.baseUrl, options.path, options.query);
+  validateMaxResponseBytes(options.maxResponseBytes);
   return execute(
     {
       method: "GET",
       url,
       headers: authHeaders(options.pat, "application/json"),
     },
-    (response) => decodeJson<T>(response, url),
+    (response) => decodeJson<T>(response, url, options.maxResponseBytes),
   );
 }
 
@@ -398,10 +522,14 @@ export interface BinaryResponse {
 
 export async function atlassianGetBinary(options: RequestOptions): Promise<BinaryResponse> {
   const url = buildUrl(options.baseUrl, options.path, options.query);
-  const maximum = options.maxResponseBytes;
-  if (maximum !== undefined && (!Number.isSafeInteger(maximum) || maximum <= 0)) {
-    throw new Error("maxResponseBytes must be a positive safe integer.");
-  }
+  validateMaxResponseBytes(options.maxResponseBytes);
+  const limit: BodyLimit = {
+    // An absent budget keeps the historical "unbounded" behaviour for callers
+    // that never opted in; every in-tree caller passes an explicit value.
+    maximum: options.maxResponseBytes ?? Number.MAX_SAFE_INTEGER,
+    subject: "Attachment response",
+    guidance: "configured by ATLASSIAN_MAX_ATTACHMENT_BYTES.",
+  };
 
   return execute(
     {
@@ -409,61 +537,17 @@ export async function atlassianGetBinary(options: RequestOptions): Promise<Binar
       url,
       headers: authHeaders(options.pat, "*/*"),
     },
-    async (response) => {
-      const contentLength = response.headers.get("content-length");
-      if (maximum !== undefined && contentLength !== null) {
-        const declared = Number(contentLength);
-        if (!Number.isSafeInteger(declared) || declared < 0) {
-          void response.body?.cancel().catch(() => undefined);
-          throw new Error("Attachment response declared an invalid Content-Length.");
-        }
-        if (declared > maximum) {
-          void response.body?.cancel().catch(() => undefined);
-          throw new Error(
-            `Attachment response size ${declared} bytes exceeds the maximum of ${maximum} bytes ` +
-              "configured by ATLASSIAN_MAX_ATTACHMENT_BYTES.",
-          );
-        }
-      }
-
-      let data: Buffer;
-      if (!response.body) {
-        data = Buffer.alloc(0);
-      } else {
-        const reader = response.body.getReader();
-        const chunks: Buffer[] = [];
-        let size = 0;
-        try {
-          for (;;) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            size += value.byteLength;
-            if (maximum !== undefined && size > maximum) {
-              await reader.cancel().catch(() => undefined);
-              throw new Error(
-                `Attachment response size exceeds the maximum of ${maximum} bytes ` +
-                  "configured by ATLASSIAN_MAX_ATTACHMENT_BYTES.",
-              );
-            }
-            chunks.push(Buffer.from(value));
-          }
-        } finally {
-          reader.releaseLock();
-        }
-        data = Buffer.concat(chunks, size);
-      }
-
-      return {
-        data,
-        contentType: response.headers.get("content-type") || "application/octet-stream",
-        contentDisposition: response.headers.get("content-disposition") || "",
-      };
-    },
+    async (response) => ({
+      data: await readBoundedBody(response, limit),
+      contentType: response.headers.get("content-type") || "application/octet-stream",
+      contentDisposition: response.headers.get("content-disposition") || "",
+    }),
   );
 }
 
 async function atlassianWrite<T>(method: "POST" | "PUT", options: RequestOptions): Promise<T> {
   const url = buildUrl(options.baseUrl, options.path, options.query);
+  validateMaxResponseBytes(options.maxResponseBytes);
   return execute(
     {
       method,
@@ -474,7 +558,7 @@ async function atlassianWrite<T>(method: "POST" | "PUT", options: RequestOptions
       },
       body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
     },
-    (response) => decodeJson<T>(response, url),
+    (response) => decodeJson<T>(response, url, options.maxResponseBytes),
   );
 }
 
@@ -496,6 +580,7 @@ export async function atlassianPostFormData<T = any>(
   options: FormDataRequestOptions,
 ): Promise<T> {
   const url = buildUrl(options.baseUrl, options.path, options.query);
+  validateMaxResponseBytes(options.maxResponseBytes);
   return execute(
     {
       method: "POST",
@@ -506,7 +591,7 @@ export async function atlassianPostFormData<T = any>(
       },
       body: options.body,
     },
-    (response) => decodeJson<T>(response, url),
+    (response) => decodeJson<T>(response, url, options.maxResponseBytes),
   );
 }
 
@@ -528,12 +613,13 @@ export async function atlassianPut<T = any>(options: RequestOptions): Promise<T>
  */
 export async function atlassianDelete<T = any>(options: RequestOptions): Promise<T> {
   const url = buildUrl(options.baseUrl, options.path, options.query);
+  validateMaxResponseBytes(options.maxResponseBytes);
   return execute(
     {
       method: "DELETE",
       url,
       headers: authHeaders(options.pat, "application/json"),
     },
-    (response) => decodeJson<T>(response, url),
+    (response) => decodeJson<T>(response, url, options.maxResponseBytes),
   );
 }

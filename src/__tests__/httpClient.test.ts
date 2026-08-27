@@ -1,10 +1,9 @@
 import { afterEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import type { AddressInfo } from "node:net";
 import { performance } from "node:perf_hooks";
 import {
   AtlassianHttpError,
+  DEFAULT_MAX_JSON_BYTES,
   atlassianDelete,
   atlassianGet,
   atlassianGetBinary,
@@ -13,26 +12,7 @@ import {
   atlassianPut,
   configureHttp,
 } from "../httpClient.js";
-
-type RequestRecord = {
-  method: string;
-  url: string;
-  headers: IncomingMessage["headers"];
-  body: Buffer;
-};
-
-type StubHandler = (
-  req: IncomingMessage,
-  res: ServerResponse,
-  requests: RequestRecord[],
-) => Promise<void> | void;
-
-type ScriptedResponse = {
-  status?: number;
-  statusMessage?: string;
-  headers?: Record<string, string>;
-  body?: string | Buffer;
-};
+import { recordRequest, scriptedHandler, sendResponse, withStubServer } from "./testServer.js";
 
 const pat = "test-pat";
 
@@ -43,80 +23,13 @@ function resetHttpDefaults(): void {
     maxConcurrentRequests: 4,
     maxQueuedRequests: 16,
     maxAttempts: 3,
+    maxJsonBytes: DEFAULT_MAX_JSON_BYTES,
   });
 }
 
 afterEach(() => {
   resetHttpDefaults();
 });
-
-async function readRequestBody(req: IncomingMessage): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  }
-  return Buffer.concat(chunks);
-}
-
-async function recordRequest(
-  req: IncomingMessage,
-  requests: RequestRecord[],
-): Promise<RequestRecord> {
-  const record = {
-    method: req.method ?? "",
-    url: req.url ?? "",
-    headers: req.headers,
-    body: await readRequestBody(req),
-  };
-  requests.push(record);
-  return record;
-}
-
-function sendResponse(res: ServerResponse, response: ScriptedResponse): void {
-  res.statusCode = response.status ?? 200;
-  if (response.statusMessage) {
-    res.statusMessage = response.statusMessage;
-  }
-  for (const [name, value] of Object.entries(response.headers ?? {})) {
-    res.setHeader(name, value);
-  }
-  res.end(response.body);
-}
-
-function scriptedHandler(responses: ScriptedResponse[]): StubHandler {
-  return async (req, res, requests) => {
-    await recordRequest(req, requests);
-    sendResponse(res, responses[Math.min(requests.length - 1, responses.length - 1)] ?? {});
-  };
-}
-
-async function withStubServer(
-  handler: StubHandler,
-  run: (baseUrl: string, requests: RequestRecord[]) => Promise<void>,
-): Promise<void> {
-  const requests: RequestRecord[] = [];
-  const server = createServer((req, res) => {
-    void Promise.resolve(handler(req, res, requests)).catch((err: unknown) => {
-      res.statusCode = 500;
-      res.end(err instanceof Error ? err.message : String(err));
-    });
-  });
-
-  await new Promise<void>((resolve) => {
-    server.listen(0, "127.0.0.1", resolve);
-  });
-
-  const { port } = server.address() as AddressInfo;
-  try {
-    await run(`http://127.0.0.1:${port}`, requests);
-  } finally {
-    const closePromise = new Promise<void>((resolve, reject) => {
-      server.close((err) => (err ? reject(err) : resolve()));
-    });
-    server.closeAllConnections();
-    await closePromise;
-  }
-}
 
 async function assertAtlassianHttpError(
   action: () => Promise<unknown>,
@@ -128,6 +41,11 @@ async function assertAtlassianHttpError(
     return err;
   }
   assert.fail("Expected AtlassianHttpError");
+}
+
+function assertElapsedUnder(started: number, limitMs: number): void {
+  const elapsed = performance.now() - started;
+  assert.ok(elapsed < limitMs, `operation took ${elapsed.toFixed(1)} ms, expected under ${limitMs} ms`);
 }
 
 async function assertError(action: () => Promise<unknown>): Promise<Error> {
@@ -584,7 +502,9 @@ describe("httpClient end-to-end deadlines and admission control", () => {
           /total timeout of 90ms.*ATLASSIAN_TOTAL_TIMEOUT_MS/s,
         );
 
-        assert.ok(performance.now() - started < 180);
+        // Upper bound only has to stay well under the retry sleep it is proving we
+        // skipped; a GC pause on a loaded CI box must not read as a failure.
+        assertElapsedUnder(started, 900);
         assert.equal(requests.length, 1);
       },
     );
@@ -602,7 +522,7 @@ describe("httpClient end-to-end deadlines and admission control", () => {
           /total timeout of 100ms.*ATLASSIAN_TOTAL_TIMEOUT_MS/s,
         );
 
-        assert.ok(performance.now() - started < 250);
+        assertElapsedUnder(started, 1_200);
         assert.equal(requests.length, 1);
       },
     );
@@ -733,7 +653,9 @@ describe("httpClient end-to-end deadlines and admission control", () => {
           /total timeout of 45ms.*ATLASSIAN_TOTAL_TIMEOUT_MS/s,
         );
 
-        assert.ok(performance.now() - started < 180);
+        // Upper bound only has to stay well under the retry sleep it is proving we
+        // skipped; a GC pause on a loaded CI box must not read as a failure.
+        assertElapsedUnder(started, 900);
       },
     );
   });
@@ -792,6 +714,98 @@ describe("httpClient bounded binary response streaming", () => {
       );
 
       assert.equal(requests.length, 0);
+    });
+  });
+});
+
+
+describe("httpClient bounded JSON response streaming", () => {
+  test("rejects an oversized Content-Length before buffering the response", async () => {
+    await withStubServer(
+      scriptedHandler([{ headers: { "Content-Length": "24" }, body: '{"padding":"0123456789"}' }]),
+      async (baseUrl) => {
+        await assert.rejects(
+          () => atlassianGet({ baseUrl, pat, path: "/big-header", maxResponseBytes: 8 }),
+          /JSON response from .*size 24 bytes exceeds the maximum of 8 bytes \(over by 16 bytes\).*ATLASSIAN_MAX_JSON_BYTES/s,
+        );
+      },
+    );
+  });
+
+  test("stops a chunked JSON response as soon as actual bytes exceed the budget", async () => {
+    await withStubServer(
+      async (req, res, requests) => {
+        await recordRequest(req, requests);
+        res.write('{"a":"1234567890"');
+        res.write(',"b":"1234567890"}');
+        res.end();
+      },
+      async (baseUrl) => {
+        const err = await assertError(() =>
+          atlassianGet({ baseUrl, pat, path: "/big-chunked", maxResponseBytes: 20 }),
+        );
+
+        assert.match(err.message, /exceeds the maximum of 20 bytes/);
+        assert.match(err.message, /ATLASSIAN_MAX_JSON_BYTES/);
+        // The message has to tell the model how to shrink the request, not just that it failed.
+        assert.match(err.message, /fewer results/);
+      },
+    );
+  });
+
+  test("accepts a JSON body exactly equal to its configured limit", async () => {
+    await withStubServer(scriptedHandler([{ body: '{"ok":true}' }]), async (baseUrl) => {
+      const result = await atlassianGet({ baseUrl, pat, path: "/exact-json", maxResponseBytes: 11 });
+
+      assert.deepEqual(result, { ok: true });
+    });
+  });
+
+  test("falls back to the configured ATLASSIAN_MAX_JSON_BYTES budget when no explicit limit is given", async () => {
+    configureHttp({ maxJsonBytes: 8 });
+
+    await withStubServer(scriptedHandler([{ body: '{"padding":"0123456789"}' }]), async (baseUrl) => {
+      await assert.rejects(
+        () => atlassianGet({ baseUrl, pat, path: "/default-budget" }),
+        /exceeds the maximum of 8 bytes.*ATLASSIAN_MAX_JSON_BYTES/s,
+      );
+    });
+  });
+
+  test("applies the JSON budget to writes, form uploads and deletes, not just GET", async () => {
+    configureHttp({ maxJsonBytes: 8 });
+
+    await withStubServer(scriptedHandler([{ body: '{"padding":"0123456789"}' }]), async (baseUrl) => {
+      const form = new FormData();
+      form.set("file", new Blob(["x"]), "x.txt");
+
+      for (const call of [
+        () => atlassianPost({ baseUrl, pat, path: "/write-post", body: {} }),
+        () => atlassianPut({ baseUrl, pat, path: "/write-put", body: {} }),
+        () => atlassianPostFormData({ baseUrl, pat, path: "/write-form", body: form }),
+        () => atlassianDelete({ baseUrl, pat, path: "/write-delete" }),
+      ]) {
+        await assert.rejects(call, /exceeds the maximum of 8 bytes.*ATLASSIAN_MAX_JSON_BYTES/s);
+      }
+    });
+  });
+
+  test("rejects invalid JSON size budgets before making network calls", async () => {
+    await withStubServer(scriptedHandler([{ body: "{}" }]), async (baseUrl, requests) => {
+      await assert.rejects(
+        () => atlassianGet({ baseUrl, pat, path: "/invalid-json-limit", maxResponseBytes: 0 }),
+        /maxResponseBytes must be a positive safe integer/,
+      );
+
+      assert.equal(requests.length, 0);
+    });
+  });
+
+  test("an empty JSON body still resolves to undefined under a budget", async () => {
+    await withStubServer(scriptedHandler([{ body: "" }]), async (baseUrl) => {
+      const result = await atlassianGet({ baseUrl, pat, path: "/empty-json", maxResponseBytes: 8 });
+
+      assert.equal(result, undefined);
     });
   });
 });

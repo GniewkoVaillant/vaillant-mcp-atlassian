@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -291,7 +293,121 @@ describe("readExistingAttachment", () => {
       /Attachment upload size is 5 bytes, exceeding the 4-byte/,
     );
   });
+
+  // Regression coverage for the file *types* O_NOFOLLOW does not cover. Before the
+  // pre-open lstat, open(O_RDONLY) on a writer-less FIFO blocked in the kernel
+  // forever, so every case below is raced against a timeout: a hang must surface as
+  // a failing assertion rather than as a suite that never finishes.
+  test("rejects a FIFO promptly instead of blocking forever in open()", async () => {
+    const fifo = join(directory, "pipe.fifo");
+    makeFifo(fifo);
+
+    await assert.rejects(
+      withDeadline(readExistingAttachment(policy(), fifo), "readExistingAttachment on a FIFO"),
+      /^Error: Attachment filePath must point to a regular file\.$/,
+    );
+  });
+
+  test("keeps unrelated filesystem I/O alive after more FIFO attempts than libuv has threads", async () => {
+    // UV_THREADPOOL_SIZE defaults to 4; six blocked opens used to wedge the whole
+    // process, including reads of ordinary files that never touched this module.
+    const fifos = Array.from({ length: 6 }, (_unused, index) => join(directory, `pipe-${index}.fifo`));
+    for (const fifo of fifos) {
+      makeFifo(fifo);
+    }
+    const witness = join(directory, "witness.txt");
+    await writeFile(witness, "threadpool still healthy");
+
+    await Promise.all(
+      fifos.map((fifo) =>
+        assert.rejects(
+          withDeadline(readExistingAttachment(policy(), fifo), `readExistingAttachment on ${fifo}`),
+          /must point to a regular file/,
+        ),
+      ),
+    );
+
+    assert.equal(await withDeadline(readFile(witness, "utf8"), "plain readFile"), "threadpool still healthy");
+  });
+
+  test("rejects a unix domain socket promptly", async () => {
+    const socketPath = join(directory, "listener.sock");
+    const server = createServer();
+    await new Promise<void>((resolveListen, rejectListen) => {
+      server.once("error", rejectListen);
+      server.listen(socketPath, resolveListen);
+    });
+
+    try {
+      await assert.rejects(
+        withDeadline(readExistingAttachment(policy(), socketPath), "readExistingAttachment on a socket"),
+        /^Error: Attachment filePath must point to a regular file\.$/,
+      );
+    } finally {
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    }
+  });
+
+  test("rejects a character device promptly", async () => {
+    await assert.rejects(
+      withDeadline(readExistingAttachment({ attachmentDirs: ["/dev"] }, "/dev/null"), "character device"),
+      /^Error: Attachment filePath must point to a regular file\.$/,
+    );
+  });
+
+  test("refuses a hard link into the allowlist without returning the linked file's bytes", async () => {
+    const allowed = join(directory, "allowed");
+    const outside = join(directory, "outside");
+    await mkdir(allowed);
+    await mkdir(outside);
+    const secret = join(outside, "secret.txt");
+    await writeFile(secret, "credentials that must never reach Jira");
+    const innocent = join(allowed, "innocent.txt");
+    // realpath() reports an allowlisted path and isFile() passes: only nlink betrays
+    // that these bytes were created outside the allowed directories.
+    await link(secret, innocent);
+
+    let leaked: string | undefined;
+    await assert.rejects(
+      (async () => {
+        leaked = (await readExistingAttachment({ attachmentDirs: [allowed] }, innocent)).data.toString("utf8");
+      })(),
+      /^Error: Attachment filePath has 2 hard links, so the same file is also reachable under another name that may sit outside the allowed directories; refusing to read it\.$/,
+    );
+    assert.equal(leaked, undefined);
+    assert.equal(await readFile(secret, "utf8"), "credentials that must never reach Jira");
+  });
+
+  test("refuses a hard link even when both names sit inside the allowlist", async () => {
+    // Conservative on purpose: nothing in stat() says where the other name lives.
+    const original = join(directory, "upload.txt");
+    await writeFile(original, "payload");
+    await link(original, join(directory, "alias.txt"));
+
+    await assert.rejects(readExistingAttachment(policy(), original), /hard links/);
+  });
 });
+
+function makeFifo(path: string): void {
+  execFileSync("mkfifo", [path]);
+}
+
+/**
+ * Fails instead of hanging. A regression of the FIFO defect makes the underlying
+ * open() never return, which would otherwise stall the whole test run.
+ */
+async function withDeadline<T>(operation: Promise<T>, label: string, milliseconds = 5_000): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} did not settle within ${milliseconds}ms`)), milliseconds);
+    timer.unref();
+  });
+  try {
+    return await Promise.race([operation, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /** macOS resolves the temporary directory through /private, so compare canonically. */
 async function realpathOf(target: string): Promise<string> {

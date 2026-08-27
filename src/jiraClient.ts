@@ -15,6 +15,8 @@ import {
 import { atlassianDelete, atlassianGet, atlassianGetBinary, atlassianPost, atlassianPostFormData, atlassianPut, AtlassianHttpError, } from "./httpClient.js";
 import { decodeProformaDesign, formatProformaAnswer, getProformaChunkCount, } from "./proforma.js";
 import { DEFAULT_CONCURRENCY, mapWithConcurrency } from "./concurrency.js";
+import { fetchPaginatedJiraValues, resolveMaxPaginationPages } from "./jiraPagination.js";
+import { describeUpstreamValue, requireUpstreamArray, requireUpstreamObject } from "./upstreamShape.js";
 
 export interface ClientOptions {
     baseUrl: string;
@@ -28,9 +30,56 @@ export interface ClientOptions {
     attachmentDirs?: string[];
     /** Maximum number of bytes accepted for attachment uploads and downloads. */
     maxAttachmentBytes?: number;
+    /** Maximum number of pages fetched by any one automatically paginated call. */
+    maxPaginationPages?: number;
 }
 
 const MAX_PROFORMA_CHUNKS = 25;
+
+/**
+ * How many ProForma forms getProformaFormsSummary reads in parallel.
+ *
+ * Each form can fan out into DEFAULT_CONCURRENCY (5) parallel chunk requests,
+ * so the real in-flight count is this number times 5. The HTTP client accepts
+ * 4 active plus 16 queued requests before it rejects with "queue is full", and
+ * other tools share that pool, so 3 x 5 = 15 keeps the whole fan-out inside the
+ * default budget with headroom instead of overrunning it at 5 x 5 = 25.
+ */
+const PROFORMA_FORM_CONCURRENCY = 3;
+
+/**
+ * Gate for the `fields` object Jira returns on an issue. The mapping code
+ * indexes into it directly, so when a reverse proxy truncates the body or the
+ * instance answers with an error envelope the resulting TypeError names neither
+ * the issue nor the request - useless to an agent deciding what to do next.
+ */
+function requireIssueFields(issue: any, issueKey: string): Record<string, any> {
+    const fields = issue?.fields;
+    if (!fields || typeof fields !== "object" || Array.isArray(fields)) {
+        throw new Error(`Jira issue ${issueKey} response did not contain a "fields" object ` +
+            `(received ${describeUpstreamValue(fields)}).`);
+    }
+    return fields;
+}
+
+/**
+ * Gate for a list Jira is expected to return. A missing list is treated as
+ * empty - matching how the Agile client tolerates an absent page - but a
+ * present non-list is a broken response and is reported as one.
+ */
+function requireOptionalArray(value: unknown, description: string): any[] {
+    return requireUpstreamArray("Jira", value, description);
+}
+
+/**
+ * Gate for a response envelope Jira is expected to return. An empty 200 body -
+ * what a reverse proxy, a DC-side timeout or an SSO login redirect produces -
+ * decodes to `undefined`, and destructuring or indexing that yields a
+ * TypeError naming neither the issue nor the request.
+ */
+function requireResponseObject(value: unknown, description: string): Record<string, any> {
+    return requireUpstreamObject("Jira", value, description);
+}
 
 export interface JiraIssueSummary {
     key: string;
@@ -368,8 +417,11 @@ function extractCoAuthors(message: string): string[] {
 /** Extracts status-field transitions from a list of changelog histories, appending them to `out`. */
 function collectStatusTransitions(histories: any[], out: JiraStatusTransition[]): void {
     for (const history of histories) {
-        for (const item of history.items || []) {
-            if (item.field !== "status")
+        // A history entry that is not an object is upstream noise, not a
+        // transition; skipping it beats a TypeError from inside the mapper.
+        const items = Array.isArray(history?.items) ? history.items : [];
+        for (const item of items) {
+            if (item?.field !== "status")
                 continue;
             out.push({
                 from: item.fromString || "",
@@ -432,23 +484,51 @@ export class JiraClient {
      * admin edits a custom field — but get_issue_fields needs it on every call.
      * Cache it for the lifetime of a short TTL instead of refetching per call.
      */
-    private fieldDefinitions: { fetchedAt: number; fields: any[] } | null = null;
+    private fieldDefinitions: { fetchedAt: number; fields: Promise<any[]> } | null = null;
     private static readonly FIELD_CACHE_TTL_MS = 5 * 60 * 1000;
+    /**
+     * Page budget for the one collection this client walks itself, the
+     * dedicated changelog endpoint. Same option, same default and same
+     * validation as JiraAgileClient and ConfluenceClient.
+     */
+    private readonly maxPaginationPages: number;
     constructor(options: ClientOptions) {
         this.options = options;
+        this.maxPaginationPages = resolveMaxPaginationPages(options.maxPaginationPages);
     }
     private async getFieldDefinitions(): Promise<any[]> {
         const cached = this.fieldDefinitions;
         if (cached && Date.now() - cached.fetchedAt < JiraClient.FIELD_CACHE_TTL_MS) {
             return cached.fields;
         }
-        const fields = await atlassianGet({
-            baseUrl: this.options.baseUrl,
-            pat: this.options.pat,
-            path: "/rest/api/2/field",
+        // Cache the in-flight promise rather than the result: the catalogue is
+        // a few hundred kilobytes on a real instance, and N concurrent callers
+        // on a cold cache would otherwise each fetch their own copy.
+        const pending = (async (): Promise<any[]> => {
+            const fields = await atlassianGet({
+                baseUrl: this.options.baseUrl,
+                pat: this.options.pat,
+                path: "/rest/api/2/field",
+            });
+            if (fields === undefined || fields === null) {
+                return [];
+            }
+            if (!Array.isArray(fields)) {
+                throw new Error("Jira field catalogue (/rest/api/2/field) returned an invalid response: " +
+                    `expected an array of field definitions, received ${describeUpstreamValue(fields)}.`);
+            }
+            return fields;
+        })();
+        const entry = { fetchedAt: Date.now(), fields: pending };
+        this.fieldDefinitions = entry;
+        // A failed fetch must not be cached: drop the entry so the next call
+        // retries instead of replaying the same rejection for the whole TTL.
+        pending.catch(() => {
+            if (this.fieldDefinitions === entry) {
+                this.fieldDefinitions = null;
+            }
         });
-        this.fieldDefinitions = { fetchedAt: Date.now(), fields: fields || [] };
-        return this.fieldDefinitions.fields;
+        return pending;
     }
     async searchIssues(jql: string, maxResults = 20, startAt = 0): Promise<JiraIssueSearchResult> {
         const data = await atlassianGet({
@@ -462,15 +542,19 @@ export class JiraClient {
                 fields: "summary,status,assignee,issuetype,priority",
             },
         });
-        const issues: JiraIssueSummary[] = (data.issues || []).map((issue: any) => ({
-            key: issue.key,
-            summary: issue.fields.summary || "",
-            status: issue.fields.status?.name || "Unknown",
-            assignee: userLabel(issue.fields.assignee),
-            issueType: issue.fields.issuetype?.name || "Unknown",
-            priority: issue.fields.priority?.name || "Unknown",
-        }));
-        const total = typeof data.total === "number" ? data.total : startAt + issues.length;
+        const issues: JiraIssueSummary[] = requireOptionalArray(data?.issues, "search result page")
+            .map((issue: any) => {
+            const fields = issue?.fields ?? {};
+            return {
+                key: issue?.key ?? "",
+                summary: fields.summary || "",
+                status: fields.status?.name || "Unknown",
+                assignee: userLabel(fields.assignee),
+                issueType: fields.issuetype?.name || "Unknown",
+                priority: fields.priority?.name || "Unknown",
+            };
+        });
+        const total = typeof data?.total === "number" ? data.total : startAt + issues.length;
         const nextStartAt = startAt + issues.length;
         const hasMore = issues.length > 0 && nextStartAt < total;
         // Reporting `total` and `hasMore` matters: without them a truncated
@@ -507,12 +591,13 @@ export class JiraClient {
                 fields: `summary,status,${storyPointsField}`,
             },
         });
-        return (data.issues || []).map((issue: any) => {
-            const raw = issue.fields[storyPointsField];
+        return requireOptionalArray(data?.issues, "search result page").map((issue: any) => {
+            const fields = issue?.fields ?? {};
+            const raw = fields[storyPointsField];
             return {
-                key: issue.key,
-                summary: issue.fields.summary || "",
-                status: issue.fields.status?.name || "Unknown",
+                key: issue?.key ?? "",
+                summary: fields.summary || "",
+                status: fields.status?.name || "Unknown",
                 storyPoints: typeof raw === "number" ? raw : null,
             };
         });
@@ -526,7 +611,8 @@ export class JiraClient {
                 fields: "summary,description,status,assignee,reporter,created,updated,comment",
             },
         });
-        const allComments = issue.fields.comment?.comments || [];
+        const issueFields = requireIssueFields(issue, issueKey);
+        const allComments = requireOptionalArray(issueFields.comment?.comments, `comment list on issue ${issueKey}`);
         // Long-lived issues can carry hundreds of comments. Return the most
         // recent ones and say how many were held back, rather than flooding
         // the context or silently pretending the tail does not exist.
@@ -539,14 +625,14 @@ export class JiraClient {
             created: c.created || "",
         }));
         return {
-            key: issue.key,
-            summary: issue.fields.summary || "",
-            description: issue.fields.description || "",
-            status: issue.fields.status?.name || "Unknown",
-            assignee: userLabel(issue.fields.assignee),
-            reporter: userLabel(issue.fields.reporter),
-            created: issue.fields.created || "",
-            updated: issue.fields.updated || "",
+            key: issue.key || issueKey,
+            summary: issueFields.summary || "",
+            description: issueFields.description || "",
+            status: issueFields.status?.name || "Unknown",
+            assignee: userLabel(issueFields.assignee),
+            reporter: userLabel(issueFields.reporter),
+            created: issueFields.created || "",
+            updated: issueFields.updated || "",
             commentTotal: allComments.length,
             commentsTruncated: allComments.length > comments.length,
             comments,
@@ -557,25 +643,31 @@ export class JiraClient {
      * to discover a project key from inside the agent — it has to be known
      * up front.
      */
-    async listProjects(query?: string): Promise<JiraProjectSummary[]> {
+    async listProjects(query?: string, limit?: number): Promise<JiraProjectSummary[]> {
         const projects = await atlassianGet({
             baseUrl: this.options.baseUrl,
             pat: this.options.pat,
             path: "/rest/api/2/project",
         });
         const normalized = query?.trim().toLowerCase();
-        return (projects || [])
+        const matched = requireOptionalArray(projects, "project list")
             .map((project: any) => ({
-                id: project.id,
-                key: project.key,
-                name: project.name || "",
-                projectTypeKey: project.projectTypeKey || "",
-                lead: project.lead?.displayName || project.lead?.name || "",
+                id: project?.id,
+                key: typeof project?.key === "string" ? project.key : "",
+                name: project?.name || "",
+                projectTypeKey: project?.projectTypeKey || "",
+                lead: project?.lead?.displayName || project?.lead?.name || "",
             }))
             .filter((project: JiraProjectSummary) =>
                 !normalized ||
                 project.key.toLowerCase().includes(normalized) ||
                 project.name.toLowerCase().includes(normalized));
+        // A Data Center instance routinely carries hundreds of projects, and
+        // this is the only listing tool without a ceiling: without a limit the
+        // caller has no way to ask for a smaller answer.
+        return typeof limit === "number" && Number.isFinite(limit) && limit >= 0
+            ? matched.slice(0, Math.floor(limit))
+            : matched;
     }
     /**
      * Lists the transitions currently available on an issue, including which
@@ -584,13 +676,14 @@ export class JiraClient {
      * "Field 'resolution' is required" failure.
      */
     async getTransitions(issueKey: string): Promise<JiraTransitionOption[]> {
-        const { transitions } = await atlassianGet({
+        const response = requireResponseObject(await atlassianGet({
             baseUrl: this.options.baseUrl,
             pat: this.options.pat,
             path: `/rest/api/2/issue/${encodeURIComponent(issueKey)}/transitions`,
             query: { expand: "transitions.fields" },
-        });
-        return (transitions || []).map((transition: any) => {
+        }), `transition list response for issue ${issueKey}`);
+        const transitions = requireOptionalArray(response.transitions, `transition list on issue ${issueKey}`);
+        return transitions.map((transition: any) => {
             const fields = transition.fields || {};
             return {
                 id: transition.id,
@@ -624,11 +717,14 @@ export class JiraClient {
     }
     async getIssueFields(issueKey: string, fieldNames: string[] = [], includeEmpty = false): Promise<JiraIssueFieldValue[]> {
         const definitions = await this.getFieldDefinitions();
+        // Field entries without a usable id cannot be requested or read back,
+        // and a missing `name` must not take the whole lookup down with it.
+        const usable = definitions.filter((field: any) => field && typeof field.id === "string");
         const requested = new Set(fieldNames.map((name) => name.toLocaleLowerCase()));
         const selected = requested.size === 0
-            ? definitions.filter((field: any) => !["attachment", "comment", "worklog"].includes(field.id))
-            : definitions.filter((field: any) => requested.has(field.id.toLocaleLowerCase()) ||
-                requested.has(field.name.toLocaleLowerCase()));
+            ? usable.filter((field: any) => !["attachment", "comment", "worklog"].includes(field.id))
+            : usable.filter((field: any) => requested.has(field.id.toLocaleLowerCase()) ||
+                requested.has(String(field.name ?? "").toLocaleLowerCase()));
         if (requested.size > 0 && selected.length === 0) {
             throw new Error(`No Jira fields matched: ${fieldNames.join(", ")}`);
         }
@@ -638,13 +734,14 @@ export class JiraClient {
             path: `/rest/api/2/issue/${encodeURIComponent(issueKey)}`,
             query: { fields: selected.map((field: any) => field.id).join(",") },
         });
+        const issueFields = requireIssueFields(issue, issueKey);
         return selected
-            .filter((field: any) => includeEmpty || hasFieldValue(issue.fields[field.id]))
+            .filter((field: any) => includeEmpty || hasFieldValue(issueFields[field.id]))
             .map((field: any) => ({
             id: field.id,
-            name: field.name,
+            name: typeof field.name === "string" && field.name ? field.name : field.id,
             custom: field.custom === true,
-            value: issue.fields[field.id],
+            value: issueFields[field.id],
         }))
             .sort((left: JiraIssueFieldValue, right: JiraIssueFieldValue) => left.name.localeCompare(right.name));
     }
@@ -658,22 +755,50 @@ export class JiraClient {
                 return [];
             throw error;
         }
-        return (index.forms || []).map((form: any) => ({
-            id: form.id,
-            templateId: form.templateId ?? null,
-            name: form.name?.trim() || `Form ${form.id}`,
-            submitted: form.submitted === true,
-            created: form.created || "",
-            updated: form.updated || "",
+        // Data Center returns {"key":…,"value":null} for a property that was
+        // cleared but not deleted, so a null index is a real answer here - it
+        // just is not a form index, and saying so beats a bare TypeError.
+        if (index === undefined || index === null) {
+            throw new Error(`Issue property "proforma.forms" on ${issueKey} holds no value ` +
+                `(received ${describeUpstreamValue(index)}); the property exists but was cleared.`);
+        }
+        if (typeof index !== "object" || Array.isArray(index)) {
+            throw new Error(`Issue property "proforma.forms" on ${issueKey} is not a ProForma form index ` +
+                `(received ${describeUpstreamValue(index)}).`);
+        }
+        return requireOptionalArray(index.forms, `ProForma form index on issue ${issueKey}`)
+            .map((form: any) => ({
+            id: form?.id,
+            templateId: form?.templateId ?? null,
+            name: form?.name?.trim() || `Form ${form?.id}`,
+            submitted: form?.submitted === true,
+            created: form?.created || "",
+            updated: form?.updated || "",
         }));
     }
-    async getProformaForm(issueKey: string, formId: number, includeEmpty = false): Promise<JiraProformaForm> {
-        const metadata = (await this.listProformaForms(issueKey)).find((form: JiraProformaFormSummary) => form.id === formId);
+    /**
+     * Reads one ProForma form. `knownMetadata` lets a caller that already holds
+     * the form index - see getProformaFormsSummary - skip re-fetching it; the
+     * three-argument call used by the jira_get_proforma_form tool is unchanged.
+     */
+    async getProformaForm(
+        issueKey: string,
+        formId: number,
+        includeEmpty = false,
+        knownMetadata?: JiraProformaFormSummary,
+    ): Promise<JiraProformaForm> {
+        const metadata = knownMetadata && knownMetadata.id === formId
+            ? knownMetadata
+            : (await this.listProformaForms(issueKey)).find((form: JiraProformaFormSummary) => form.id === formId);
         if (!metadata) {
             throw new Error(`ProForma form ${formId} was not found on issue ${issueKey}`);
         }
         const propertyKey = `proforma.forms.i${formId}`;
         const root = await this.getIssueProperty(issueKey, propertyKey);
+        if (!root || typeof root !== "object" || Array.isArray(root)) {
+            throw new Error(`ProForma form ${formId} ("${metadata.name}") on issue ${issueKey} stores no usable ` +
+                `data in issue property "${propertyKey}" (received ${describeUpstreamValue(root)}).`);
+        }
         const chunkCount = getProformaChunkCount(root);
         if (chunkCount > MAX_PROFORMA_CHUNKS) {
             throw new Error(
@@ -687,8 +812,14 @@ export class JiraClient {
             (index) => this.getIssueProperty(issueKey, `${propertyKey}.${index}`),
         );
         const design = decodeProformaDesign(root, additionalChunks);
-        const questions = design.questions || {};
-        const stateAnswers = root.state?.answers || {};
+        const questions = design?.questions && typeof design.questions === "object" && !Array.isArray(design.questions)
+            ? design.questions
+            : {};
+        const stateAnswers = root.state?.answers ?? {};
+        if (typeof stateAnswers !== "object" || Array.isArray(stateAnswers)) {
+            throw new Error(`ProForma form ${formId} ("${metadata.name}") on issue ${issueKey} returned invalid ` +
+                `answers in "${propertyKey}": expected an object, received ${describeUpstreamValue(stateAnswers)}.`);
+        }
         const rawStatus = root.state?.status;
         const answers = Object.entries(stateAnswers)
             .map(([questionId, rawAnswer]) => {
@@ -718,7 +849,15 @@ export class JiraClient {
     }
     async getProformaFormsSummary(issueKey: string, includeEmpty = false): Promise<JiraProformaForm[]> {
         const forms = await this.listProformaForms(issueKey);
-        return mapWithConcurrency(forms, DEFAULT_CONCURRENCY, (form: JiraProformaFormSummary) => this.getProformaForm(issueKey, form.id, includeEmpty));
+        // Hand each worker the metadata we already hold: getProformaForm would
+        // otherwise re-read the whole proforma.forms index once per form (N+1).
+        // The reduced outer width keeps the nested chunk fan-out inside the
+        // shared HTTP budget - see PROFORMA_FORM_CONCURRENCY.
+        return mapWithConcurrency(
+            forms,
+            PROFORMA_FORM_CONCURRENCY,
+            (form: JiraProformaFormSummary) => this.getProformaForm(issueKey, form.id, includeEmpty, form),
+        );
     }
     async listAttachments(issueKey: string): Promise<JiraAttachmentSummary[]> {
         const issue = await atlassianGet({
@@ -727,7 +866,9 @@ export class JiraClient {
             path: `/rest/api/2/issue/${encodeURIComponent(issueKey)}`,
             query: { fields: "attachment" },
         });
-        return (issue.fields.attachment || []).map((attachment: any) => ({
+        const issueFields = requireIssueFields(issue, issueKey);
+        return requireOptionalArray(issueFields.attachment, `attachment list on issue ${issueKey}`)
+            .map((attachment: any) => ({
             id: attachment.id,
             filename: attachment.filename || `attachment-${attachment.id}`,
             author: userLabel(attachment.author),
@@ -801,7 +942,7 @@ export class JiraClient {
             pat: this.options.pat,
             path: "/rest/api/2/issueLinkType",
         });
-        return response.issueLinkTypes || [];
+        return requireOptionalArray(response?.issueLinkTypes, "issue link type list");
     }
     async getIssueLinks(issueKey: string): Promise<JiraIssueLinkSummary[]> {
         const issue = await atlassianGet({
@@ -810,14 +951,16 @@ export class JiraClient {
             path: `/rest/api/2/issue/${encodeURIComponent(issueKey)}`,
             query: { fields: "issuelinks" },
         });
-        return (issue.fields.issuelinks || []).map((link: any) => {
-            const direction = link.outwardIssue ? "outward" : "inward";
-            const linkedIssue = link.outwardIssue || link.inwardIssue;
+        const issueFields = requireIssueFields(issue, issueKey);
+        return requireOptionalArray(issueFields.issuelinks, `issue link list on issue ${issueKey}`)
+            .map((link: any) => {
+            const direction = link?.outwardIssue ? "outward" : "inward";
+            const linkedIssue = link?.outwardIssue || link?.inwardIssue;
             return {
-                id: link.id,
-                type: link.type.name,
+                id: link?.id,
+                type: link?.type?.name || "",
                 direction,
-                description: direction === "outward" ? link.type.outward : link.type.inward,
+                description: (direction === "outward" ? link?.type?.outward : link?.type?.inward) || "",
                 issueKey: linkedIssue?.key || "",
                 summary: linkedIssue?.fields?.summary || "",
                 status: linkedIssue?.fields?.status?.name || "Unknown",
@@ -852,6 +995,17 @@ export class JiraClient {
             pat: this.options.pat,
             path: `/rest/api/2/issue/${encodeURIComponent(issueKey)}/properties/${encodeURIComponent(propertyKey)}`,
         });
+        // Jira answers with {"key":…,"value":…}. An empty 200 body - a reverse
+        // proxy dropping the payload, or a DC-side timeout - has to be named as
+        // such instead of surfacing as "Cannot read properties of undefined".
+        if (!property || typeof property !== "object" || Array.isArray(property)) {
+            throw new Error(`Jira returned an unusable response for issue property "${propertyKey}" on ` +
+                `${issueKey}: expected an object with a "value", received ${describeUpstreamValue(property)}.`);
+        }
+        if (!("value" in property)) {
+            throw new Error(`Jira response for issue property "${propertyKey}" on ${issueKey} contains ` +
+                `no "value" field.`);
+        }
         return property.value;
     }
     /**
@@ -981,12 +1135,13 @@ export class JiraClient {
      * before adding more, and to find the id of an entry to delete.
      */
     async listWorklogs(issueKey: string): Promise<JiraWorklogEntry[]> {
-        const response = await atlassianGet({
+        const response = requireResponseObject(await atlassianGet({
             baseUrl: this.options.baseUrl,
             pat: this.options.pat,
             path: `/rest/api/2/issue/${encodeURIComponent(issueKey)}/worklog`,
-        });
-        return (response.worklogs || []).map((worklog: any) => ({
+        }), `worklog list response for issue ${issueKey}`);
+        return requireOptionalArray(response.worklogs, `worklog list on issue ${issueKey}`)
+            .map((worklog: any) => ({
             id: worklog.id,
             issueKey,
             author: userLabel(worklog.author),
@@ -1011,12 +1166,13 @@ export class JiraClient {
     }
     /** Lists the users watching an issue. */
     async listWatchers(issueKey: string): Promise<JiraWatcher[]> {
-        const response = await atlassianGet({
+        const response = requireResponseObject(await atlassianGet({
             baseUrl: this.options.baseUrl,
             pat: this.options.pat,
             path: `/rest/api/2/issue/${encodeURIComponent(issueKey)}/watchers`,
-        });
-        return (response.watchers || []).map((watcher: any) => ({
+        }), `watcher list response for issue ${issueKey}`);
+        return requireOptionalArray(response.watchers, `watcher list on issue ${issueKey}`)
+            .map((watcher: any) => ({
             name: watcher.name || "",
             displayName: watcher.displayName || watcher.name || "Unknown",
             active: watcher.active !== false,
@@ -1218,25 +1374,31 @@ export class JiraClient {
             throw error;
         }
     }
+    /**
+     * Walks the dedicated changelog endpoint through the shared, bounded Jira
+     * pagination helper.
+     *
+     * This loop used to be hand-rolled and `while (true)`: its three exit
+     * conditions all depended on metadata the server may simply omit, so a
+     * page with rows, no `isLast` and no `total` compared `startAt >= undefined`
+     * (always false) and it hammered the instance until the process died. The
+     * helper caps the number of upstream requests, rejects a `startAt` that
+     * does not advance and a page that repeats, and refuses to hand back a
+     * partial history - an issue's status timeline missing its middle is worse
+     * than an error, because nothing downstream can tell it is incomplete.
+     */
     async getIssueChangelogViaDedicatedEndpoint(issueKey: string): Promise<JiraIssueChangelog> {
+        const histories = await fetchPaginatedJiraValues({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            maxPaginationPages: this.maxPaginationPages,
+            path: `/rest/api/2/issue/${encodeURIComponent(issueKey)}/changelog`,
+            itemProperty: "values",
+            maxResults: 100,
+            resourceName: `issue ${issueKey} changelog`,
+        });
         const transitions: JiraStatusTransition[] = [];
-        const maxResults = 100;
-        let startAt = 0;
-        while (true) {
-            const page = await atlassianGet({
-                baseUrl: this.options.baseUrl,
-                pat: this.options.pat,
-                path: `/rest/api/2/issue/${encodeURIComponent(issueKey)}/changelog`,
-                query: { startAt, maxResults },
-            });
-            const values = page.values || [];
-            collectStatusTransitions(values, transitions);
-            startAt += values.length;
-            const isLast = page.isLast !== undefined ? page.isLast : values.length === 0;
-            if (isLast || values.length === 0 || startAt >= page.total) {
-                break;
-            }
-        }
+        collectStatusTransitions(histories, transitions);
         transitions.sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
         return { key: issueKey, transitions };
     }
@@ -1255,7 +1417,10 @@ export class JiraClient {
             query: { expand: "changelog", fields: "summary" },
         });
         const transitions: JiraStatusTransition[] = [];
-        collectStatusTransitions(issue.changelog?.histories || [], transitions);
+        collectStatusTransitions(
+            requireOptionalArray(issue?.changelog?.histories, `changelog history on issue ${issueKey}`),
+            transitions,
+        );
         transitions.sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
         return { key: issueKey, transitions };
     }

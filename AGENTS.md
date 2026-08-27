@@ -31,7 +31,9 @@ authentication, networking, filesystem access, tool registration or deployment.
 4. Update `.env.example`, `README.md`, `docs/SECURITY-ARCHITECTURE.md` and
    `docs/IMPLEMENTATION-REPORT.md` whenever the corresponding behavior,
    safeguards, configuration or deployment assumptions change.
-5. Run `npm run build`, `npm run test:unit` and an isolated stdio smoke test.
+5. Run the full gate: `npm test`, which is `npm run lint` followed by
+   `npm run test:unit` and `npm run test:smoke`. Running the latter two alone
+   skips the lint gate. `npm run build` is implied — both test scripts call it.
    Real upstream calls are disabled by default and require
    `ATLASSIAN_SMOKE_LIVE=true`; report clearly whether live access was verified.
 6. Record unresolved risks and distinguish implemented controls from planned

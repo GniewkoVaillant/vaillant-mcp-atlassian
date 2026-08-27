@@ -12,6 +12,7 @@
 import { McpServer, type ToolCallback } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
+import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { loadConfig, type ToolGroup } from "./config.js";
@@ -38,6 +39,57 @@ function formatError(error: unknown): string {
  * than (or as well as) the remote Atlassian instance.
  */
 type ToolKind = "read" | "write" | "destructive" | "local";
+
+/**
+ * Shared parameter schemas. Without them the model can spend a full round trip
+ * on an argument that could never work — `jira_get_issue({issueKey: "https://
+ * jira/browse/ABC-123"})` used to validate, reach Jira and come back 404.
+ * These are token-cost guards, not a security boundary: every interpolation
+ * into a REST path is already encodeURIComponent-escaped.
+ */
+const issueKeySchema = z
+    .string()
+    .max(255)
+    .regex(
+        /^[A-Za-z][A-Za-z0-9_]*-[1-9][0-9]*$/,
+        "Must be a bare Jira issue key such as 'ABC-123' — not a URL, summary or ID",
+    );
+/** Confluence content IDs (pages, comments, attachments) are decimal integers. */
+const numericIdSchema = z
+    .string()
+    .max(32)
+    .regex(/^[1-9][0-9]*$/, "Must be a numeric Atlassian content ID such as '601156620'");
+/** Free-text bodies: generous, but not "the model pastes 10 MB" generous. */
+const MAX_TEXT_FIELD_CHARS = 100_000;
+const MAX_TITLE_CHARS = 255;
+const textFieldSchema = z
+    .string()
+    .max(MAX_TEXT_FIELD_CHARS, `Must be at most ${MAX_TEXT_FIELD_CHARS} characters`);
+const titleFieldSchema = z
+    .string()
+    .max(MAX_TITLE_CHARS, `Must be at most ${MAX_TITLE_CHARS} characters`);
+
+/**
+ * Caps a tool result so a single call cannot swallow the model's context. A
+ * `jira_get_issue` on a busy issue measured 350 kB (~88k tokens) with no
+ * truncation and no warning. Truncation is announced in-band so the model can
+ * tell a fragment from a complete answer, and knows what to do about it.
+ */
+function clampToolText(text: string, maxBytes: number): string {
+    const buf = Buffer.from(text, "utf8");
+    if (buf.length <= maxBytes) return text;
+    const marker = (dropped: number) =>
+        `\n…[truncated: ${dropped} of ${buf.length} bytes omitted — narrow the query ` +
+        "(smaller limit/maxResults, more specific JQL/CQL) and retry]";
+    // Reserve the marker's own bytes so the result really fits the ceiling.
+    // Only a pathologically small ceiling (under ~140 bytes) overshoots, and
+    // then the marker alone is more useful than a silently empty answer.
+    const reserve = Buffer.byteLength(marker(buf.length), "utf8");
+    let head = buf.subarray(0, Math.max(0, maxBytes - reserve)).toString("utf8");
+    // Slicing bytes can cut a multi-byte code point in half; drop the remnant.
+    if (head.endsWith("\uFFFD")) head = head.slice(0, -1);
+    return head + marker(buf.length - Buffer.byteLength(head, "utf8"));
+}
 async function main() {
     const config = loadConfig();
     configureHttp({
@@ -45,12 +97,14 @@ async function main() {
         totalTimeoutMs: config.totalTimeoutMs,
         maxConcurrentRequests: config.maxConcurrentRequests,
         maxQueuedRequests: config.maxQueuedRequests,
+        maxJsonBytes: config.maxJsonBytes,
     });
     const jiraClient = new JiraClient({
         baseUrl: config.jiraBaseUrl,
         pat: config.jiraPat,
         attachmentDirs: config.attachmentDirs,
         maxAttachmentBytes: config.maxAttachmentBytes,
+        maxPaginationPages: config.maxPaginationPages,
     });
     const jiraAgileClient = new JiraAgileClient({
         baseUrl: config.jiraBaseUrl,
@@ -62,6 +116,7 @@ async function main() {
         pat: config.confluencePat,
         attachmentDirs: config.attachmentDirs,
         maxAttachmentBytes: config.maxAttachmentBytes,
+        maxPaginationPages: config.maxPaginationPages,
     });
     const server = new McpServer(
         {
@@ -101,6 +156,15 @@ async function main() {
             description?: string;
             inputSchema?: InputArgs;
             annotations?: ToolAnnotations;
+            /**
+             * Cross-field precondition, checked before the handler runs and so
+             * before any HTTP request. Returns a message naming what is missing,
+             * or undefined when the arguments are usable. Zod's raw-shape schemas
+             * cannot express "at least one of these", and an update with no
+             * fields is not a no-op: it still burns a version, an audit entry and
+             * a watcher notification.
+             */
+            validate?: (args: any) => string | undefined;
         },
         handler: ToolCallback<InputArgs>,
     ): void {
@@ -114,7 +178,22 @@ async function main() {
             const requestId = randomUUID();
             log("debug", { event: "tool.start", requestId, tool: name, kind });
             try {
+                const problem = spec.validate?.((args as any[])[0]);
+                if (problem !== undefined) {
+                    throw new McpError(
+                        ErrorCode.InvalidParams,
+                        `Input validation error: Invalid arguments for tool ${name}: ${problem}`,
+                    );
+                }
                 const result: any = await (handler as any)(...args);
+                // Every handler's text output goes through the same ceiling.
+                if (Array.isArray(result?.content)) {
+                    for (const part of result.content) {
+                        if (part?.type === "text" && typeof part.text === "string") {
+                            part.text = clampToolText(part.text, config.maxToolResultBytes);
+                        }
+                    }
+                }
                 log(result?.isError ? "error" : "info", {
                     event: "tool.finish",
                     requestId,
@@ -141,7 +220,6 @@ async function main() {
             {
                 ...spec,
                 annotations: {
-                    ...spec.annotations,
                     readOnlyHint: kind === "read",
                     destructiveHint: kind === "destructive",
                     // Re-running a read or a delete converges on the same state;
@@ -149,6 +227,12 @@ async function main() {
                     idempotentHint: kind === "read" || kind === "destructive",
                     // Even attachment tools contact a remote Atlassian host.
                     openWorldHint: true,
+                    // Deliberately last: a per-tool annotation overrides the value
+                    // derived from `kind`. Several "write" tools overwrite content
+                    // in place rather than adding to it, and the MCP default for
+                    // destructiveHint is true — claiming false there is a false
+                    // negative in the dangerous direction.
+                    ...spec.annotations,
                 },
             },
             instrumented,
@@ -164,17 +248,19 @@ async function main() {
                 .string()
                 .optional()
                 .describe("Optional case-insensitive filter matched against project key and name"),
+            limit: z.number().int().min(1).max(500).optional()
+                .describe("Maximum number of projects to return (applied after the query filter)"),
         },
-    }, async ({ query }) => {
+    }, async ({ query, limit }) => {
         try {
-            const projects = await jiraClient.listProjects(query);
+            const projects = await jiraClient.listProjects(query, limit);
             return {
                 content: [
                     {
                         type: "text",
                         text: projects.length === 0
                             ? "No projects found."
-                            : JSON.stringify(projects, null, 2),
+                            : JSON.stringify(projects),
                     },
                 ],
             };
@@ -206,6 +292,7 @@ async function main() {
                 .number()
                 .int()
                 .min(0)
+                .max(10000)
                 .optional()
                 .describe("Zero-based index of the first result to return; pass `nextStartAt` from a previous call"),
         },
@@ -218,7 +305,7 @@ async function main() {
                         type: "text",
                         text: results.total === 0
                             ? "No issues found."
-                            : JSON.stringify(results, null, 2),
+                            : JSON.stringify(results),
                     },
                 ],
             };
@@ -237,7 +324,7 @@ async function main() {
             "comments are returned; `commentTotal` is the real count and `commentsTruncated` says " +
             "whether older ones were held back. Read-only.",
         inputSchema: {
-            issueKey: z.string().describe("Jira issue key, e.g. 'ABC-123'"),
+            issueKey: issueKeySchema.describe("Jira issue key, e.g. 'ABC-123'"),
             maxComments: z
                 .number()
                 .int()
@@ -250,7 +337,7 @@ async function main() {
         try {
             const issue = await jiraClient.getIssue(issueKey, maxComments ?? 30);
             return {
-                content: [{ type: "text", text: JSON.stringify(issue, null, 2) }],
+                content: [{ type: "text", text: JSON.stringify(issue) }],
             };
         }
         catch (error) {
@@ -266,7 +353,7 @@ async function main() {
             "and other projects whose important data lives in custom fields. By default returns all " +
             "non-empty fields except bulky comments, attachments, and worklogs. Read-only.",
         inputSchema: {
-            issueKey: z.string().describe("Jira issue key, e.g. 'PPM-21345'"),
+            issueKey: issueKeySchema.describe("Jira issue key, e.g. 'PPM-21345'"),
             fieldNames: z
                 .array(z.string())
                 .max(100)
@@ -280,7 +367,7 @@ async function main() {
     }, async ({ issueKey, fieldNames, includeEmpty }) => {
         try {
             const fields = await jiraClient.getIssueFields(issueKey, fieldNames ?? ([] as string[]), includeEmpty ?? false);
-            return { content: [{ type: "text", text: JSON.stringify(fields, null, 2) }] };
+            return { content: [{ type: "text", text: JSON.stringify(fields) }] };
         }
         catch (error) {
             return {
@@ -295,7 +382,7 @@ async function main() {
             "submission state, and timestamps. Reads standard Jira issue properties; no separate " +
             "ProForma API permission is required. Read-only.",
         inputSchema: {
-            issueKey: z.string().describe("Jira issue key, e.g. 'PPM-21345'"),
+            issueKey: issueKeySchema.describe("Jira issue key, e.g. 'PPM-21345'"),
         },
     }, async ({ issueKey }) => {
         try {
@@ -304,7 +391,7 @@ async function main() {
                 content: [
                     {
                         type: "text",
-                        text: forms.length === 0 ? "No ProForma forms found." : JSON.stringify(forms, null, 2),
+                        text: forms.length === 0 ? "No ProForma forms found." : JSON.stringify(forms),
                     },
                 ],
             };
@@ -323,7 +410,7 @@ async function main() {
         description: "Decode one Forms (ProForma) form attached to a Jira issue and return readable question " +
             "labels, selected choice labels, answers, and completion counts. Read-only.",
         inputSchema: {
-            issueKey: z.string().describe("Jira issue key, e.g. 'PPM-21345'"),
+            issueKey: issueKeySchema.describe("Jira issue key, e.g. 'PPM-21345'"),
             formId: z.number().int().positive().describe("Form ID returned by jira_list_proforma_forms"),
             includeEmpty: z
                 .boolean()
@@ -333,7 +420,7 @@ async function main() {
     }, async ({ issueKey, formId, includeEmpty }) => {
         try {
             const form = await jiraClient.getProformaForm(issueKey, formId, includeEmpty ?? false);
-            return { content: [{ type: "text", text: JSON.stringify(form, null, 2) }] };
+            return { content: [{ type: "text", text: JSON.stringify(form) }] };
         }
         catch (error) {
             return {
@@ -349,7 +436,7 @@ async function main() {
         description: "Decode all Forms (ProForma) forms attached to a Jira issue into readable question and " +
             "answer data. Best for completeness audits of PPM requests. Read-only.",
         inputSchema: {
-            issueKey: z.string().describe("Jira issue key, e.g. 'PPM-21345'"),
+            issueKey: issueKeySchema.describe("Jira issue key, e.g. 'PPM-21345'"),
             includeEmpty: z
                 .boolean()
                 .optional()
@@ -362,7 +449,7 @@ async function main() {
                 content: [
                     {
                         type: "text",
-                        text: forms.length === 0 ? "No ProForma forms found." : JSON.stringify(forms, null, 2),
+                        text: forms.length === 0 ? "No ProForma forms found." : JSON.stringify(forms),
                     },
                 ],
             };
@@ -384,7 +471,7 @@ async function main() {
         description: "List attachment metadata for a Jira issue, including IDs, filenames, authors, sizes, MIME " +
             "types, and download URLs. Read-only.",
         inputSchema: {
-            issueKey: z.string().describe("Jira issue key, e.g. 'PPM-21345'"),
+            issueKey: issueKeySchema.describe("Jira issue key, e.g. 'PPM-21345'"),
         },
     }, async ({ issueKey }) => {
         try {
@@ -395,7 +482,7 @@ async function main() {
                         type: "text",
                         text: attachments.length === 0
                             ? "No attachments found."
-                            : JSON.stringify(attachments, null, 2),
+                            : JSON.stringify(attachments),
                     },
                 ],
             };
@@ -418,7 +505,7 @@ async function main() {
     }, async ({ attachmentId, outputPath }) => {
         try {
             const result = await jiraClient.downloadAttachment(attachmentId, outputPath);
-            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+            return { content: [{ type: "text", text: JSON.stringify(result) }] };
         }
         catch (error) {
             return {
@@ -434,7 +521,7 @@ async function main() {
         description: "Upload a local file as an attachment to a Jira issue. Mutates data: creates a real " +
             "attachment on the issue.",
         inputSchema: {
-            issueKey: z.string().describe("Jira issue key, e.g. 'PPM-21345'"),
+            issueKey: issueKeySchema.describe("Jira issue key, e.g. 'PPM-21345'"),
             filePath: z.string().describe("Absolute path to the local file to upload"),
             mimeType: z
                 .string()
@@ -444,7 +531,7 @@ async function main() {
     }, async ({ issueKey, filePath, mimeType }) => {
         try {
             const result = await jiraClient.uploadAttachment(issueKey, filePath, mimeType);
-            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+            return { content: [{ type: "text", text: JSON.stringify(result) }] };
         }
         catch (error) {
             return {
@@ -462,7 +549,7 @@ async function main() {
     }, async ({ attachmentId }) => {
         try {
             const result = await jiraClient.deleteAttachment(attachmentId);
-            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+            return { content: [{ type: "text", text: JSON.stringify(result) }] };
         }
         catch (error) {
             return {
@@ -478,7 +565,7 @@ async function main() {
     }, async () => {
         try {
             const result = await jiraClient.listIssueLinkTypes();
-            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+            return { content: [{ type: "text", text: JSON.stringify(result) }] };
         }
         catch (error) {
             return {
@@ -494,7 +581,7 @@ async function main() {
         description: "Get all inward and outward issue links for a Jira issue, including relationship, linked " +
             "issue summary, and status. Read-only.",
         inputSchema: {
-            issueKey: z.string().describe("Jira issue key, e.g. 'PPM-21345'"),
+            issueKey: issueKeySchema.describe("Jira issue key, e.g. 'PPM-21345'"),
         },
     }, async ({ issueKey }) => {
         try {
@@ -503,7 +590,7 @@ async function main() {
                 content: [
                     {
                         type: "text",
-                        text: links.length === 0 ? "No issue links found." : JSON.stringify(links, null, 2),
+                        text: links.length === 0 ? "No issue links found." : JSON.stringify(links),
                     },
                 ],
             };
@@ -530,7 +617,7 @@ async function main() {
     }, async ({ linkType, inwardIssueKey, outwardIssueKey, comment }) => {
         try {
             const result = await jiraClient.createIssueLink(linkType, inwardIssueKey, outwardIssueKey, comment);
-            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+            return { content: [{ type: "text", text: JSON.stringify(result) }] };
         }
         catch (error) {
             return {
@@ -548,7 +635,7 @@ async function main() {
     }, async ({ linkId }) => {
         try {
             const result = await jiraClient.deleteIssueLink(linkId);
-            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+            return { content: [{ type: "text", text: JSON.stringify(result) }] };
         }
         catch (error) {
             return {
@@ -566,8 +653,8 @@ async function main() {
             issueType: z
                 .string()
                 .describe("Issue type name, e.g. 'Story', 'Task', 'Sub-task', 'Bug'"),
-            summary: z.string().describe("Issue summary/title"),
-            description: z.string().optional().describe("Issue description"),
+            summary: titleFieldSchema.describe("Issue summary/title"),
+            description: textFieldSchema.optional().describe("Issue description"),
             parentKey: z
                 .string()
                 .optional()
@@ -587,7 +674,7 @@ async function main() {
                 priority,
             });
             return {
-                content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+                content: [{ type: "text", text: JSON.stringify(result) }],
             };
         }
         catch (error) {
@@ -603,17 +690,27 @@ async function main() {
             "that changes the real issue. Supports common named fields plus a flexible 'fields' object " +
             "for anything else.",
         inputSchema: {
-            issueKey: z.string().describe("Jira issue key, e.g. 'ABC-123'"),
-            summary: z.string().optional().describe("New summary/title"),
-            description: z.string().optional().describe("New description"),
+            issueKey: issueKeySchema.describe("Jira issue key, e.g. 'ABC-123'"),
+            summary: titleFieldSchema.optional().describe("New summary/title"),
+            description: textFieldSchema.optional().describe("New description"),
             assignee: z.string().optional().describe("New assignee username/name"),
             priority: z.string().optional().describe("New priority name, e.g. 'High'"),
-            labels: z.array(z.string()).optional().describe("New set of labels (replaces existing)"),
+            labels: z.array(z.string().max(255)).max(100).optional()
+                .describe("New set of labels (replaces existing, max 100)"),
             fields: z
                 .record(z.string(), z.unknown())
                 .optional()
                 .describe("Escape hatch: raw Jira 'fields' object for anything not covered above"),
         },
+        // Overwrites the named fields in place; `labels` replaces the whole set.
+        annotations: { destructiveHint: true },
+        validate: ({ summary, description, assignee, priority, labels, fields }) =>
+            summary === undefined && description === undefined && assignee === undefined &&
+            priority === undefined && labels === undefined && fields === undefined
+                ? "nothing to update — supply at least one of: summary, description, assignee, " +
+                  "priority, labels, fields. Sending an empty change makes Jira reject the request " +
+                  "with an opaque 400."
+                : undefined,
     }, async ({ issueKey, summary, description, assignee, priority, labels, fields }) => {
         try {
             const result = await jiraClient.updateIssue(issueKey, {
@@ -625,7 +722,7 @@ async function main() {
                 fields: fields,
             });
             return {
-                content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+                content: [{ type: "text", text: JSON.stringify(result) }],
             };
         }
         catch (error) {
@@ -636,12 +733,14 @@ async function main() {
         }
     });
     tool("write", "write", "jira_assign_issue", {
+        // Overwrites the current assignee; the previous one is not merged or kept.
+        annotations: { destructiveHint: true },
         title: "Assign Jira issue",
         description: "Assign a Jira Data Center issue to a user, or unassign it by passing null. Mutates data: " +
             "sends a PUT request to the issue's assignee endpoint. Use the account's username (the " +
             "`name` field), not the display name.",
         inputSchema: {
-            issueKey: z.string().describe("Jira issue key, e.g. 'ABC-123'"),
+            issueKey: issueKeySchema.describe("Jira issue key, e.g. 'ABC-123'"),
             assignee: z
                 .string()
                 .nullable()
@@ -651,7 +750,7 @@ async function main() {
         try {
             const result = await jiraClient.assignIssue(issueKey, assignee);
             return {
-                content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+                content: [{ type: "text", text: JSON.stringify(result) }],
             };
         }
         catch (error) {
@@ -666,14 +765,14 @@ async function main() {
         description: "Add a comment to an existing Jira Data Center issue by key. Mutates data: sends a POST " +
             "request that adds a real comment.",
         inputSchema: {
-            issueKey: z.string().describe("Jira issue key, e.g. 'ABC-123'"),
-            body: z.string().describe("Comment text"),
+            issueKey: issueKeySchema.describe("Jira issue key, e.g. 'ABC-123'"),
+            body: textFieldSchema.describe("Comment text"),
         },
     }, async ({ issueKey, body }) => {
         try {
             const result = await jiraClient.addComment(issueKey, body);
             return {
-                content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+                content: [{ type: "text", text: JSON.stringify(result) }],
             };
         }
         catch (error) {
@@ -690,15 +789,17 @@ async function main() {
             "own comments unless you hold administrator/project-admin permissions to edit " +
             "others' comments.",
         inputSchema: {
-            issueKey: z.string().describe("Jira issue key, e.g. 'ABC-123'"),
-            commentId: z.string().describe("ID of the comment to edit"),
-            body: z.string().describe("New comment text"),
+            issueKey: issueKeySchema.describe("Jira issue key, e.g. 'ABC-123'"),
+            commentId: numericIdSchema.describe("ID of the comment to edit"),
+            body: textFieldSchema.describe("New comment text"),
         },
+        // Replaces the existing comment text; the previous wording is gone.
+        annotations: { destructiveHint: true },
     }, async ({ issueKey, commentId, body }) => {
         try {
             const result = await jiraClient.editComment(issueKey, commentId, body);
             return {
-                content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+                content: [{ type: "text", text: JSON.stringify(result) }],
             };
         }
         catch (error) {
@@ -715,14 +816,14 @@ async function main() {
             "Note: Jira typically only allows deleting your own comments unless you hold " +
             "administrator/project-admin permissions to delete others' comments.",
         inputSchema: {
-            issueKey: z.string().describe("Jira issue key, e.g. 'ABC-123'"),
-            commentId: z.string().describe("ID of the comment to delete"),
+            issueKey: issueKeySchema.describe("Jira issue key, e.g. 'ABC-123'"),
+            commentId: numericIdSchema.describe("ID of the comment to delete"),
         },
     }, async ({ issueKey, commentId }) => {
         try {
             const result = await jiraClient.deleteComment(issueKey, commentId);
             return {
-                content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+                content: [{ type: "text", text: JSON.stringify(result) }],
             };
         }
         catch (error) {
@@ -738,7 +839,7 @@ async function main() {
             "start time and comment. Use it to see what has already been logged before adding more, " +
             "or to find the id of an entry to delete. Read-only.",
         inputSchema: {
-            issueKey: z.string().describe("Jira issue key, e.g. 'ABC-123'"),
+            issueKey: issueKeySchema.describe("Jira issue key, e.g. 'ABC-123'"),
         },
     }, async ({ issueKey }) => {
         try {
@@ -749,7 +850,7 @@ async function main() {
                         type: "text",
                         text: worklogs.length === 0
                             ? `No work has been logged on ${issueKey}.`
-                            : JSON.stringify(worklogs, null, 2),
+                            : JSON.stringify(worklogs),
                     },
                 ],
             };
@@ -767,13 +868,13 @@ async function main() {
             "be undone. Jira normally only allows deleting your own worklogs unless you hold " +
             "project-admin permissions.",
         inputSchema: {
-            issueKey: z.string().describe("Jira issue key, e.g. 'ABC-123'"),
+            issueKey: issueKeySchema.describe("Jira issue key, e.g. 'ABC-123'"),
             worklogId: z.string().describe("Worklog ID returned by jira_list_worklogs"),
         },
     }, async ({ issueKey, worklogId }) => {
         try {
             const result = await jiraClient.deleteWorklog(issueKey, worklogId);
-            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+            return { content: [{ type: "text", text: JSON.stringify(result) }] };
         }
         catch (error) {
             return {
@@ -786,7 +887,7 @@ async function main() {
         title: "List Jira issue watchers",
         description: "List the users watching a Jira Data Center issue. Read-only.",
         inputSchema: {
-            issueKey: z.string().describe("Jira issue key, e.g. 'ABC-123'"),
+            issueKey: issueKeySchema.describe("Jira issue key, e.g. 'ABC-123'"),
         },
     }, async ({ issueKey }) => {
         try {
@@ -797,7 +898,7 @@ async function main() {
                         type: "text",
                         text: watchers.length === 0
                             ? `Nobody is watching ${issueKey}.`
-                            : JSON.stringify(watchers, null, 2),
+                            : JSON.stringify(watchers),
                     },
                 ],
             };
@@ -814,13 +915,13 @@ async function main() {
         description: "Add a user as a watcher on a Jira Data Center issue, so they are notified of changes. " +
             "Mutates data. Use the account's username (the `name` field), not the display name.",
         inputSchema: {
-            issueKey: z.string().describe("Jira issue key, e.g. 'ABC-123'"),
+            issueKey: issueKeySchema.describe("Jira issue key, e.g. 'ABC-123'"),
             username: z.string().describe("Username to add as a watcher"),
         },
     }, async ({ issueKey, username }) => {
         try {
             const result = await jiraClient.addWatcher(issueKey, username);
-            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+            return { content: [{ type: "text", text: JSON.stringify(result) }] };
         }
         catch (error) {
             return {
@@ -830,17 +931,19 @@ async function main() {
         }
     });
     tool("write", "write", "jira_remove_watcher", {
+        // Removes an existing watcher — a deletion, not an additive update.
+        annotations: { destructiveHint: true },
         title: "Remove Jira issue watcher",
         description: "Remove a user from a Jira Data Center issue's watcher list. Mutates data, but is " +
             "reversible by adding them back.",
         inputSchema: {
-            issueKey: z.string().describe("Jira issue key, e.g. 'ABC-123'"),
+            issueKey: issueKeySchema.describe("Jira issue key, e.g. 'ABC-123'"),
             username: z.string().describe("Username to remove from the watcher list"),
         },
     }, async ({ issueKey, username }) => {
         try {
             const result = await jiraClient.removeWatcher(issueKey, username);
-            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+            return { content: [{ type: "text", text: JSON.stringify(result) }] };
         }
         catch (error) {
             return {
@@ -855,7 +958,7 @@ async function main() {
             "sends a POST request that adds a real worklog entry, including the time spent and an " +
             "optional comment and start time.",
         inputSchema: {
-            issueKey: z.string().describe("Jira issue key, e.g. 'ABC-123'"),
+            issueKey: issueKeySchema.describe("Jira issue key, e.g. 'ABC-123'"),
             timeSpent: z
                 .string()
                 .describe("Time spent in Jira duration format, e.g. '1h 30m', '3h', '45m'"),
@@ -869,7 +972,7 @@ async function main() {
         try {
             const result = await jiraClient.addWorklog(issueKey, { timeSpent, comment, started });
             return {
-                content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+                content: [{ type: "text", text: JSON.stringify(result) }],
             };
         }
         catch (error) {
@@ -889,7 +992,7 @@ async function main() {
             "always created with internal status 'TRACKED' — there is no REST endpoint to submit it " +
             "(status 'SUBMITTED'); that step still requires the Jira UI.",
         inputSchema: {
-            issueKey: z.string().describe("Jira issue key, e.g. 'ABC-123'"),
+            issueKey: issueKeySchema.describe("Jira issue key, e.g. 'ABC-123'"),
             timeSpent: z
                 .string()
                 .describe("Time spent in Jira duration format, e.g. '1h 30m', '3h', '45m'"),
@@ -911,7 +1014,7 @@ async function main() {
                 started,
             });
             return {
-                content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+                content: [{ type: "text", text: JSON.stringify(result) }],
             };
         }
         catch (error) {
@@ -930,7 +1033,7 @@ async function main() {
             "values where Jira publishes them). Call this before jira_transition_issue when a workflow " +
             "might demand a resolution or similar field. Read-only.",
         inputSchema: {
-            issueKey: z.string().describe("Jira issue key, e.g. 'ABC-123'"),
+            issueKey: issueKeySchema.describe("Jira issue key, e.g. 'ABC-123'"),
         },
     }, async ({ issueKey }) => {
         try {
@@ -941,7 +1044,7 @@ async function main() {
                         type: "text",
                         text: transitions.length === 0
                             ? `No transitions are available on ${issueKey} for this user.`
-                            : JSON.stringify(transitions, null, 2),
+                            : JSON.stringify(transitions),
                     },
                 ],
             };
@@ -954,6 +1057,8 @@ async function main() {
         }
     });
     tool("write", "write", "jira_transition_issue", {
+        // Moves the issue to another workflow state; some transitions are one-way.
+        annotations: { destructiveHint: true },
         title: "Transition Jira issue status",
         description: "Transition a Jira Data Center issue to a new status by name (case-insensitive). Mutates data: " +
             "looks up available transitions, then sends a POST request that changes the real issue's " +
@@ -963,7 +1068,7 @@ async function main() {
             "message names the missing fields and their allowed values, and jira_get_transitions shows " +
             "them up front.",
         inputSchema: {
-            issueKey: z.string().describe("Jira issue key, e.g. 'ABC-123'"),
+            issueKey: issueKeySchema.describe("Jira issue key, e.g. 'ABC-123'"),
             targetStatus: z
                 .string()
                 .describe("Target status name to transition to, e.g. 'In Progress', 'Done'"),
@@ -976,7 +1081,7 @@ async function main() {
         try {
             const result = await jiraClient.transitionIssue(issueKey, targetStatus, fields);
             return {
-                content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+                content: [{ type: "text", text: JSON.stringify(result) }],
             };
         }
         catch (error) {
@@ -994,13 +1099,13 @@ async function main() {
             "issue, fetched from the dedicated paginated changelog endpoint (not capped like the " +
             "expand=changelog param). Useful for auditing exact workflow timing. Read-only.",
         inputSchema: {
-            issueKey: z.string().describe("Jira issue key, e.g. 'ABC-123'"),
+            issueKey: issueKeySchema.describe("Jira issue key, e.g. 'ABC-123'"),
         },
     }, async ({ issueKey }) => {
         try {
             const changelog = await jiraClient.getIssueChangelog(issueKey);
             return {
-                content: [{ type: "text", text: JSON.stringify(changelog, null, 2) }],
+                content: [{ type: "text", text: JSON.stringify(changelog) }],
             };
         }
         catch (error) {
@@ -1040,7 +1145,7 @@ async function main() {
         try {
             const results = await jiraClient.getIssuesCycleTime(issueKeys, fromStatus ?? "In Progress", toStatus ?? "Done");
             return {
-                content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
+                content: [{ type: "text", text: JSON.stringify(results) }],
             };
         }
         catch (error) {
@@ -1060,13 +1165,13 @@ async function main() {
             "This is a more reliable link between a Jira issue and its code changes than text-matching " +
             "ticket keys against commit messages. Read-only.",
         inputSchema: {
-            issueKey: z.string().describe("Jira issue key, e.g. 'ABC-123'"),
+            issueKey: issueKeySchema.describe("Jira issue key, e.g. 'ABC-123'"),
         },
     }, async ({ issueKey }) => {
         try {
             const devStatus = await jiraClient.getIssueDevStatus(issueKey);
             return {
-                content: [{ type: "text", text: JSON.stringify(devStatus, null, 2) }],
+                content: [{ type: "text", text: JSON.stringify(devStatus) }],
             };
         }
         catch (error) {
@@ -1095,7 +1200,7 @@ async function main() {
         try {
             const results = await jiraClient.getIssuesDevStatus(issueKeys);
             return {
-                content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
+                content: [{ type: "text", text: JSON.stringify(results) }],
             };
         }
         catch (error) {
@@ -1145,7 +1250,7 @@ async function main() {
                 content: [
                     {
                         type: "text",
-                        text: JSON.stringify({ storyPointsField: fieldId, storyPointsFieldName: fieldName, issues }, null, 2),
+                        text: JSON.stringify({ storyPointsField: fieldId, storyPointsFieldName: fieldName, issues }),
                     },
                 ],
             };
@@ -1183,7 +1288,7 @@ async function main() {
                         type: "text",
                         text: boards.length === 0
                             ? "No boards found."
-                            : JSON.stringify(boards, null, 2),
+                            : JSON.stringify(boards),
                     },
                 ],
             };
@@ -1213,7 +1318,7 @@ async function main() {
                 content: [
                     {
                         type: "text",
-                        text: sprints.length === 0 ? "No sprints found." : JSON.stringify(sprints, null, 2),
+                        text: sprints.length === 0 ? "No sprints found." : JSON.stringify(sprints),
                     },
                 ],
             };
@@ -1247,7 +1352,7 @@ async function main() {
         try {
             const report = await jiraAgileClient.getSprintReport(boardId, sprintId);
             return {
-                content: [{ type: "text", text: JSON.stringify(report, null, 2) }],
+                content: [{ type: "text", text: JSON.stringify(report) }],
             };
         }
         catch (error) {
@@ -1279,7 +1384,7 @@ async function main() {
         try {
             const report = await jiraAgileClient.getBoardVelocity(boardId, numSprints ?? 3);
             return {
-                content: [{ type: "text", text: JSON.stringify(report, null, 2) }],
+                content: [{ type: "text", text: JSON.stringify(report) }],
             };
         }
         catch (error) {
@@ -1313,6 +1418,7 @@ async function main() {
                 .number()
                 .int()
                 .min(0)
+                .max(10000)
                 .optional()
                 .describe("Zero-based index of the first result to return; pass `nextStart` from a previous call"),
         },
@@ -1325,7 +1431,7 @@ async function main() {
                         type: "text",
                         text: results.total === 0
                             ? "No pages found."
-                            : JSON.stringify(results, null, 2),
+                            : JSON.stringify(results),
                     },
                 ],
             };
@@ -1344,13 +1450,13 @@ async function main() {
         description: "Get a Confluence Data Center page's content by its page ID. Storage-format HTML is converted " +
             "to plain text where reasonably possible. Read-only.",
         inputSchema: {
-            pageId: z.string().describe("Confluence page ID, e.g. '123456'"),
+            pageId: numericIdSchema.describe("Confluence page ID, e.g. '123456'"),
         },
     }, async ({ pageId }) => {
         try {
             const page = await confluenceClient.getPage(pageId);
             return {
-                content: [{ type: "text", text: JSON.stringify(page, null, 2) }],
+                content: [{ type: "text", text: JSON.stringify(page) }],
             };
         }
         catch (error) {
@@ -1380,7 +1486,7 @@ async function main() {
                 content: [
                     {
                         type: "text",
-                        text: spaces.length === 0 ? "No spaces found." : JSON.stringify(spaces, null, 2),
+                        text: spaces.spaces.length === 0 ? "No spaces found." : JSON.stringify(spaces),
                     },
                 ],
             };
@@ -1405,7 +1511,7 @@ async function main() {
         try {
             const page = await confluenceClient.getPageByTitle(spaceKey, title);
             return {
-                content: [{ type: "text", text: JSON.stringify(page, null, 2) }],
+                content: [{ type: "text", text: JSON.stringify(page) }],
             };
         }
         catch (error) {
@@ -1422,7 +1528,7 @@ async function main() {
         description: "List the direct child pages of a Confluence Data Center page, with id, title, space and " +
             "URL. Use it to walk a documentation tree without guessing at CQL. Read-only.",
         inputSchema: {
-            pageId: z.string().describe("Confluence page ID, e.g. '601156620'"),
+            pageId: numericIdSchema.describe("Confluence page ID, e.g. '601156620'"),
             limit: z
                 .number()
                 .int()
@@ -1438,9 +1544,9 @@ async function main() {
                 content: [
                     {
                         type: "text",
-                        text: children.length === 0
+                        text: children.children.length === 0
                             ? "This page has no child pages."
-                            : JSON.stringify(children, null, 2),
+                            : JSON.stringify(children),
                     },
                 ],
             };
@@ -1459,7 +1565,7 @@ async function main() {
         description: "List comments on a Confluence Data Center page, including comment IDs, authors, creation " +
             "dates, versions, and readable bodies. Read-only.",
         inputSchema: {
-            pageId: z.string().describe("Confluence page ID, e.g. '601156620'"),
+            pageId: numericIdSchema.describe("Confluence page ID, e.g. '601156620'"),
             limit: z
                 .number()
                 .int()
@@ -1475,7 +1581,7 @@ async function main() {
                 content: [
                     {
                         type: "text",
-                        text: comments.length === 0 ? "No comments found." : JSON.stringify(comments, null, 2),
+                        text: comments.comments.length === 0 ? "No comments found." : JSON.stringify(comments),
                     },
                 ],
             };
@@ -1494,13 +1600,13 @@ async function main() {
         description: "Add a comment to a Confluence Data Center page. Mutates data by creating a real comment. " +
             "Body may be plain text or simple storage-compatible HTML.",
         inputSchema: {
-            pageId: z.string().describe("Confluence page ID, e.g. '601156620'"),
-            body: z.string().describe("Comment body as plain text or simple HTML"),
+            pageId: numericIdSchema.describe("Confluence page ID, e.g. '601156620'"),
+            body: textFieldSchema.describe("Comment body as plain text or simple HTML"),
         },
     }, async ({ pageId, body }) => {
         try {
             const result = await confluenceClient.addComment(pageId, body);
-            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+            return { content: [{ type: "text", text: JSON.stringify(result) }] };
         }
         catch (error) {
             return {
@@ -1514,13 +1620,15 @@ async function main() {
         description: "Update an existing Confluence comment by ID. Mutates data and increments the comment's " +
             "content version.",
         inputSchema: {
-            commentId: z.string().describe("Comment ID returned by confluence_list_comments"),
-            body: z.string().describe("Replacement comment body as plain text or simple HTML"),
+            commentId: numericIdSchema.describe("Comment ID returned by confluence_list_comments"),
+            body: textFieldSchema.describe("Replacement comment body as plain text or simple HTML"),
         },
+        // Replaces the existing comment body; the previous wording is gone.
+        annotations: { destructiveHint: true },
     }, async ({ commentId, body }) => {
         try {
             const result = await confluenceClient.updateComment(commentId, body);
-            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+            return { content: [{ type: "text", text: JSON.stringify(result) }] };
         }
         catch (error) {
             return {
@@ -1535,12 +1643,12 @@ async function main() {
         title: "Delete Confluence comment",
         description: "Permanently delete a Confluence comment by ID. Mutates data and cannot be undone.",
         inputSchema: {
-            commentId: z.string().describe("Comment ID returned by confluence_list_comments"),
+            commentId: numericIdSchema.describe("Comment ID returned by confluence_list_comments"),
         },
     }, async ({ commentId }) => {
         try {
             const result = await confluenceClient.deleteComment(commentId);
-            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+            return { content: [{ type: "text", text: JSON.stringify(result) }] };
         }
         catch (error) {
             return {
@@ -1556,7 +1664,7 @@ async function main() {
         description: "List files attached to a Confluence Data Center page, with id, title, media type, size, " +
             "author and creation date. Read-only.",
         inputSchema: {
-            pageId: z.string().describe("Confluence page ID, e.g. '601156620'"),
+            pageId: numericIdSchema.describe("Confluence page ID, e.g. '601156620'"),
             limit: z
                 .number()
                 .int()
@@ -1574,7 +1682,7 @@ async function main() {
                         type: "text",
                         text: attachments.length === 0
                             ? "This page has no attachments."
-                            : JSON.stringify(attachments, null, 2),
+                            : JSON.stringify(attachments),
                     },
                 ],
             };
@@ -1595,14 +1703,14 @@ async function main() {
             "default, so this is disabled until deliberately enabled. Writes a local file but does not " +
             "modify Confluence.",
         inputSchema: {
-            pageId: z.string().describe("Confluence page ID the attachment belongs to"),
+            pageId: numericIdSchema.describe("Confluence page ID the attachment belongs to"),
             attachmentId: z.string().describe("Attachment ID returned by confluence_list_attachments"),
             outputPath: z.string().describe("Absolute local destination path, including filename"),
         },
     }, async ({ pageId, attachmentId, outputPath }) => {
         try {
             const result = await confluenceClient.downloadAttachment(pageId, attachmentId, outputPath);
-            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+            return { content: [{ type: "text", text: JSON.stringify(result) }] };
         }
         catch (error) {
             return {
@@ -1619,7 +1727,7 @@ async function main() {
             "edit message and whether it was a minor edit. Useful for judging whether a page is still " +
             "current. Read-only.",
         inputSchema: {
-            pageId: z.string().describe("Confluence page ID, e.g. '601156620'"),
+            pageId: numericIdSchema.describe("Confluence page ID, e.g. '601156620'"),
             limit: z
                 .number()
                 .int()
@@ -1637,7 +1745,7 @@ async function main() {
                         type: "text",
                         text: history.length === 0
                             ? "No version history was returned for this page."
-                            : JSON.stringify(history, null, 2),
+                            : JSON.stringify(history),
                     },
                 ],
             };
@@ -1657,12 +1765,12 @@ async function main() {
             "space's trash rather than erasing it, so an admin can restore it, but treat this as " +
             "destructive. Child pages are affected too — check confluence_get_page_children first.",
         inputSchema: {
-            pageId: z.string().describe("Confluence page ID to delete"),
+            pageId: numericIdSchema.describe("Confluence page ID to delete"),
         },
     }, async ({ pageId }) => {
         try {
             const result = await confluenceClient.deletePage(pageId);
-            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+            return { content: [{ type: "text", text: JSON.stringify(result) }] };
         }
         catch (error) {
             return {
@@ -1680,12 +1788,10 @@ async function main() {
             "storage-format paragraphs.",
         inputSchema: {
             spaceKey: z.string().describe("Space key, e.g. 'ENG'"),
-            title: z.string().describe("Page title"),
-            body: z
-                .string()
+            title: titleFieldSchema.describe("Page title"),
+            body: textFieldSchema
                 .describe("Page content, as plain text or simple HTML"),
-            parentId: z
-                .string()
+            parentId: numericIdSchema
                 .optional()
                 .describe("Parent page ID, to create this page as a child of an existing page"),
         },
@@ -1693,7 +1799,7 @@ async function main() {
         try {
             const result = await confluenceClient.createPage({ spaceKey, title, body, parentId });
             return {
-                content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+                content: [{ type: "text", text: JSON.stringify(result) }],
             };
         }
         catch (error) {
@@ -1711,20 +1817,28 @@ async function main() {
             "data: fetches the current page to read its version number, then sends a PUT request with " +
             "the version incremented, updating the real page. Body may be plain text or simple HTML; " +
             "plain text is automatically wrapped into storage-format paragraphs. Omit a field to leave " +
-            "it unchanged.",
+            "it unchanged. Never pass the output of confluence_get_page back in as `body`: that tool " +
+            "returns a lossy plain-text rendering, and writing it back destroys the page's macros, " +
+            "tables and layouts — edit the storage-format HTML you intend to keep instead.",
         inputSchema: {
-            pageId: z.string().describe("Confluence page ID, e.g. '123456'"),
-            title: z.string().optional().describe("New page title (omit to keep the current title)"),
-            body: z
-                .string()
+            pageId: numericIdSchema.describe("Confluence page ID, e.g. '123456'"),
+            title: titleFieldSchema.optional().describe("New page title (omit to keep the current title)"),
+            body: textFieldSchema
                 .optional()
                 .describe("New page content, as plain text or simple HTML (omit to keep the current content)"),
         },
+        // Replaces the page body wholesale — no merge with what is already there.
+        annotations: { destructiveHint: true },
+        validate: ({ title, body }) =>
+            title === undefined && body === undefined
+                ? "nothing to update — supply at least one of: title, body. An update with neither " +
+                  "still issues a PUT that burns a page version and notifies every watcher."
+                : undefined,
     }, async ({ pageId, title, body }) => {
         try {
             const result = await confluenceClient.updatePage(pageId, { title, body });
             return {
-                content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+                content: [{ type: "text", text: JSON.stringify(result) }],
             };
         }
         catch (error) {
@@ -1737,7 +1851,35 @@ async function main() {
         }
     });
     const transport = new StdioServerTransport();
+    // 5.15: a malformed frame on stdin is otherwise swallowed whole. The SDK's
+    // ReadBuffer reports the parse failure through the protocol's `onerror`
+    // hook; with nobody listening, nothing reaches stderr and the client sits
+    // there until its own timeout. Note this is set on the protocol rather than
+    // on the transport, because Protocol.connect() overwrites transport.onerror.
+    server.server.onerror = (error: unknown) => {
+        // eslint-disable-next-line no-console
+        console.error(
+            `mcp-atlassian protocol error: ${error instanceof Error ? error.message : String(error)}`,
+        );
+    };
     await server.connect(transport);
+
+    // 5.16: without these, a SIGTERM mid-download leaves a partial file behind,
+    // and because attachments are written with O_CREAT|O_EXCL every retry then
+    // fails with "already exists".
+    let shuttingDown = false;
+    for (const signal of ["SIGINT", "SIGTERM"] as const) {
+        process.on(signal, () => {
+            if (shuttingDown) return;
+            shuttingDown = true;
+            // eslint-disable-next-line no-console
+            console.error(`mcp-atlassian received ${signal}, closing down`);
+            void server
+                .close()
+                .catch(() => undefined)
+                .finally(() => process.exit(0));
+        });
+    }
     // stdout carries the JSON-RPC stream, so all diagnostics go to stderr.
     // Report the resolved surface: without it, a profile typo silently hides
     // tools and looks like a client bug.

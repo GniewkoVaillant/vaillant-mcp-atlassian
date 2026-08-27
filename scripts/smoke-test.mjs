@@ -142,11 +142,23 @@ try {
   const annotated = tools.filter((tool) => tool.annotations);
   check("every tool is annotated", annotated.length === tools.length, `${annotated.length}/${tools.length}`);
 
-  const destructive = tools.filter((tool) => tool.annotations?.destructiveHint);
-  console.log(`  info  ${destructive.length} destructive tools: ${destructive.map((t) => t.name).join(", ") || "none"}`);
+  // destructiveHint is an advisory MCP annotation describing what a tool does to
+  // existing data; it is NOT the registration gate. Overwriting tools such as
+  // confluence_update_page carry it even though they are plain writes.
+  const destructiveHinted = tools.filter((tool) => tool.annotations?.destructiveHint);
+  console.log(`  info  ${destructiveHinted.length} tools hint destructive: ${destructiveHinted.map((t) => t.name).join(", ") || "none"}`);
 
+  // The gate is ATLASSIAN_ALLOW_DESTRUCTIVE, and what it withholds are the
+  // delete tools (kind: "destructive"). That is what this check must assert.
+  const deleteTools = tools.filter((tool) => /(^|_)delete_/.test(tool.name));
   if (!hasRealCredentials && process.env.ATLASSIAN_ALLOW_DESTRUCTIVE !== "true") {
-    check("destructive tools disabled by default", destructive.length === 0);
+    check(
+      "delete tools withheld unless ATLASSIAN_ALLOW_DESTRUCTIVE=true",
+      deleteTools.length === 0,
+      deleteTools.map((t) => t.name).join(", "),
+    );
+  } else if (process.env.ATLASSIAN_ALLOW_DESTRUCTIVE === "true") {
+    check("delete tools present when explicitly allowed", deleteTools.length === 6, `${deleteTools.length}/6`);
   }
 
   if (runLiveChecks) {

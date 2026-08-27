@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { describe, test } from "node:test";
+import { afterEach, describe, test } from "node:test";
 import { JiraAgileClient } from "../jiraAgileClient.js";
+import { DEFAULT_MAX_JSON_BYTES, configureHttp } from "../httpClient.js";
+import { assertNoQueueOverflow } from "./testServer.js";
 
 type Page = Record<string, unknown>;
 type PageHandler = (url: URL, requestNumber: number) => Page;
@@ -202,5 +204,68 @@ describe("JiraAgileClient bounded pagination", () => {
         /positive safe integer/,
       );
     }
+  });
+});
+
+/**
+ * getBoardVelocity is the other nested fan-out in this codebase: an outer
+ * mapWithConcurrency over sprints, each of which pages a sprint report. Like
+ * the ProForma summary it was only ever exercised at whatever budget the test
+ * happened to set, so the interaction with the shipped admission queue went
+ * untested.
+ */
+describe("JiraAgileClient nested fan-out under the shipped request budget", () => {
+  const PRODUCTION_HTTP_DEFAULTS = {
+    timeoutMs: 30_000,
+    totalTimeoutMs: 45_000,
+    maxConcurrentRequests: 4,
+    maxQueuedRequests: 16,
+    maxAttempts: 3,
+    maxJsonBytes: DEFAULT_MAX_JSON_BYTES,
+  } as const;
+
+  afterEach(() => {
+    configureHttp({ ...PRODUCTION_HTTP_DEFAULTS });
+  });
+
+  test("getBoardVelocity never overflows the default 4 active / 16 queued budget", async () => {
+    configureHttp({ ...PRODUCTION_HTTP_DEFAULTS });
+
+    const sprints = Array.from({ length: 24 }, (_unused, index) => ({
+      id: index + 1,
+      name: `Sprint ${index + 1}`,
+      state: "closed",
+      startDate: `2024-01-${String((index % 28) + 1).padStart(2, "0")}T00:00:00.000Z`,
+      endDate: `2024-02-${String((index % 28) + 1).padStart(2, "0")}T00:00:00.000Z`,
+      originBoardId: 1,
+    }));
+
+    await withAgileServer(
+      (url) => {
+        if (url.pathname.endsWith("/sprint")) {
+          return { values: sprints, isLast: true, startAt: 0, maxResults: 50, total: sprints.length };
+        }
+        if (url.pathname.endsWith("/configuration")) {
+          return { estimation: { field: { fieldId: "customfield_10004", displayName: "Story Points" } } };
+        }
+        if (url.pathname.includes("sprintreport")) {
+          return {
+            contents: {
+              completedIssues: [],
+              issuesNotCompletedInCurrentSprint: [],
+              puntedIssues: [],
+              completedIssuesEstimateSum: { value: 0 },
+              issuesNotCompletedEstimateSum: { value: 0 },
+            },
+            sprint: { id: 1, name: "Sprint 1", startDate: "01/Jan/24", endDate: "01/Feb/24" },
+          };
+        }
+        return { values: [], issues: [], isLast: true, startAt: 0, maxResults: 50, total: 0 };
+      },
+      async (baseUrl) => {
+        const client = new JiraAgileClient({ baseUrl, pat: "synthetic-token" });
+        await assertNoQueueOverflow(() => client.getBoardVelocity(1, 20));
+      },
+    );
   });
 });

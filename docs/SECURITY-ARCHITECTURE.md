@@ -67,10 +67,26 @@ waits only within `ATLASSIAN_MAX_QUEUED_REQUESTS` and otherwise fails closed.
 
 Retryable upstream rate limits and transient failures use bounded backoff.
 Potentially non-idempotent writes must not be replayed after ambiguous network
-failures. `ATLASSIAN_MAX_PAGINATION_PAGES` caps automatic Jira Agile pagination;
-repeated, stalled and malformed pagination is rejected instead of returning
-partial results as complete. ProForma chunk fetching uses bounded fan-out and a
-finite chunk budget.
+failures. `ATLASSIAN_MAX_PAGINATION_PAGES` caps every automatic pagination walk: the
+Jira Agile paths (boards, sprints, sprint issues), the Jira changelog walk
+(`jira_get_issue_changelog`, `jira_get_issue_cycle_time`) and the Confluence
+ones (`confluence_list_spaces`, `confluence_get_page_children`,
+`confluence_list_comments`); repeated, stalled and malformed pagination is
+rejected instead of returning partial results as complete.
+
+ProForma chunk fetching is bounded at both levels, not only the inner one. A
+single form decodes at most `MAX_PROFORMA_CHUNKS` (25) chunks, fetched
+`DEFAULT_CONCURRENCY` (5) at a time; the summary tool that walks several forms
+at once fans out over `PROFORMA_FORM_CONCURRENCY` (3) forms, so the worst-case
+in-flight fan-out for one operation is 3 x 5 = 15 requests, all of which still
+queue behind the process-wide `ATLASSIAN_MAX_CONCURRENT_REQUESTS` budget.
+
+Response size is capped in two independent places. `ATLASSIAN_MAX_JSON_BYTES`
+(default 16 MiB) refuses an oversized Jira/Confluence JSON body before it is
+buffered, so an unbounded upstream response cannot be assembled in memory.
+`ATLASSIAN_MAX_TOOL_RESULT_BYTES` (default 150000) caps the text any tool hands
+back to the MCP client, appending an explicit truncation marker that names the
+dropped byte count, so the model cannot mistake a fragment for a whole answer.
 
 ### Attachment boundary
 
@@ -79,6 +95,17 @@ contains explicit, absolute, non-root directories. Existing paths are
 canonicalized so symlinks cannot escape approved directories. Download targets
 must not overwrite existing files or traverse symlink destinations.
 `ATLASSIAN_MAX_ATTACHMENT_BYTES` limits accepted attachment sizes.
+
+Canonicalization addresses symlinks; it does not address hard links, because a
+hard link is a second name for the same inode and `realpath()` returns the
+in-policy name it was given. Uploads therefore inspect the opened file
+descriptor and refuse any file whose `nlink` is greater than 1: the bytes may
+belong to a file created outside the allowed directories, and there is no
+portable way to enumerate the other names. Uploads also `lstat()` the path
+before `open()` and pass `O_NONBLOCK` alongside `O_NOFOLLOW`, so a FIFO planted
+in an allowed directory returns immediately instead of pinning a libuv
+threadpool thread; the type check is repeated on the descriptor that was
+actually opened, which is what closes the swap window between the two calls.
 
 This local attachment mechanism is not a safe shared-cloud feature. Azure
 deployment should disable local filesystem tools or replace them with
@@ -169,12 +196,26 @@ automatically convert an Entra token into a Jira or Confluence Data Center PAT.
   prevention does not make it read-only.
 - PATs in a protected `.env` remain plaintext at rest and inherit every
   permission granted to their owners.
-- Bounded downloads are assembled in memory rather than streamed directly to
-  disk; Jira multipart uploads may temporarily hold multiple bounded copies.
-- Canonical-parent revalidation and non-following exclusive file creation stop
-  the tested symlink escapes, but Node.js does not pin every parent directory
-  with an `openat`-style descriptor. A privileged same-host filesystem race
-  remains outside the current local single-user threat model.
+- Bounded downloads and bounded JSON responses are assembled in memory rather
+  than streamed directly to disk; Jira multipart uploads may temporarily hold
+  multiple bounded copies. The ceilings (`ATLASSIAN_MAX_ATTACHMENT_BYTES`,
+  `ATLASSIAN_MAX_JSON_BYTES`) bound how much memory that can be, but an operator
+  who raises them raises the exposure with them.
+- Canonical-parent revalidation, non-following exclusive file creation, the
+  `nlink > 1` refusal and the pre-`open()` type check stop the tested symlink,
+  hard-link and FIFO escapes. What remains is narrower and genuinely does need a
+  race: Node.js does not pin every parent directory with an `openat`-style
+  descriptor, so a local attacker who can write inside an allowed directory
+  could in principle swap a component between the canonicalization and the
+  `open()`. That residual case is outside the current local single-user threat
+  model. Note what this list said before hard links were refused: it described
+  the only remaining exposure as a privileged same-host race, when in fact a
+  plain hard link needed neither privilege nor a race. A residual-risk list that
+  understates the attack is worse than no list at all.
+- The upload guard refuses any file with more than one link, including one that
+  is hard-linked entirely inside an allowed directory for legitimate reasons.
+  This is a deliberate false positive: the alternative is accepting a name whose
+  siblings cannot be enumerated.
 - Local stdio has no Entra identity, centralized authorization or durable audit
   sink; MCP logging notifications depend on client support.
 - Process-local concurrency budgets do not coordinate multiple Azure replicas.

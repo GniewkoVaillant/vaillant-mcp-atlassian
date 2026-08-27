@@ -125,17 +125,16 @@ Nie mogłem uruchomić `npm audit` w tym środowisku (blokada sieciowa sandboxa)
 
 ## Załącznik A — Mapa narzędzi MCP (grupa / rodzaj)
 
-54 zarejestrowane narzędzia w `index.ts`, z czego 8 read-only-ale-w-grupie-write (celowo, żeby profil `read` mógł je zachować — patrz komentarz w `config.ts` przy `PROFILES.read`), 5 „destructive” (zarejestrowane tylko gdy `ATLASSIAN_ALLOW_DESTRUCTIVE=true`), 2 „local” (dotykają dysku lokalnego).
+**Nieaktualne — patrz Załącznik A w [`CODE-AUDIT-2.md`](CODE-AUDIT-2.md).**
 
-| Grupa | read | write | destructive | local |
-|---|---|---|---|---|
-| core | 9 | 0 | 0 | 0 |
-| forms | 3 | 0 | 0 | 0 |
-| files | 1 | 1 | 1 | 2 |
-| links | 2 | 1 | 1 | 0 |
-| write | 5 | 10 | 3 | 0 |
-| dev | 4 | 0 | 0 | 0 |
-| agile | 5 | 0 | 0 | 0 |
+Liczności podane tu pierwotnie (54 narzędzia, „5 destructive”, core 9, files 5,
+write 5/10/3) nie zgadzały się z kodem już w chwili pisania: narzędzi
+destrukcyjnych jest 6, grupa `core` liczy 11 pozycji, `files` 6. Rozbieżność
+została wykryta w rundzie 2 audytu (pozycja D6 planu §9) i poprawiona wyłącznie
+w Załączniku A tamtego dokumentu, gdzie mapa jest zweryfikowana empirycznie
+przez `tools/list` w każdej kombinacji profilu i `ATLASSIAN_ALLOW_DESTRUCTIVE`.
+Duplikowanie jej tutaj oznaczałoby dwa źródła prawdy i drugą okazję do
+rozjechania się, więc ta sekcja jest teraz odsyłaczem, nie tabelą.
 
 ## Załącznik B — Statystyki repozytorium
 

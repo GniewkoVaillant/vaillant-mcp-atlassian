@@ -6,6 +6,11 @@
  */
 import { atlassianGet } from "./httpClient.js";
 import { DEFAULT_CONCURRENCY, mapWithConcurrency } from "./concurrency.js";
+import {
+    fetchPaginatedJiraValues,
+    type PaginationQuery,
+    resolveMaxPaginationPages,
+} from "./jiraPagination.js";
 
 export interface ClientOptions {
     baseUrl: string;
@@ -14,9 +19,6 @@ export interface ClientOptions {
     maxPaginationPages?: number;
 }
 
-const DEFAULT_MAX_PAGINATION_PAGES = 10;
-
-type PaginationQuery = Record<string, string | number | boolean | undefined>;
 
 export interface JiraBoardSummary {
     id: number;
@@ -123,16 +125,15 @@ export class JiraAgileClient {
 
     constructor(options: ClientOptions) {
         this.options = options;
-        this.maxPaginationPages = options.maxPaginationPages ?? DEFAULT_MAX_PAGINATION_PAGES;
-        if (!Number.isSafeInteger(this.maxPaginationPages) || this.maxPaginationPages <= 0) {
-            throw new Error("maxPaginationPages must be a positive safe integer.");
-        }
+        this.maxPaginationPages = resolveMaxPaginationPages(options.maxPaginationPages);
     }
 
     /**
-     * Jira DC deployments do not always agree on which pagination metadata is
-     * returned. Cap upstream calls, reject stalled/repeated pages and never
-     * pass incomplete results off as a complete board, sprint or issue list.
+     * Thin wrapper over the shared, bounded Jira pagination walk. Jira DC
+     * deployments do not always agree on which pagination metadata is
+     * returned, so upstream calls are capped, stalled/repeated pages are
+     * rejected, and an incomplete board, sprint or issue list is never passed
+     * off as a complete one.
      */
     private async getPaginatedValues(
         path: string,
@@ -141,90 +142,16 @@ export class JiraAgileClient {
         query: PaginationQuery,
         resourceName: string,
     ): Promise<any[]> {
-        const results: any[] = [];
-        const seenPageSignatures = new Set<string>();
-        let startAt = 0;
-
-        for (let pageNumber = 1; pageNumber <= this.maxPaginationPages; pageNumber += 1) {
-            const page = await atlassianGet({
-                baseUrl: this.options.baseUrl,
-                pat: this.options.pat,
-                path,
-                query: { startAt, maxResults, ...query },
-            });
-            const rawValues = page?.[itemProperty];
-            if (rawValues !== undefined && !Array.isArray(rawValues)) {
-                throw new Error(
-                    `Jira ${resourceName} pagination returned an invalid ${itemProperty} page.`,
-                );
-            }
-            const values: any[] = rawValues ?? [];
-
-            if (page?.startAt !== undefined && page.startAt !== startAt) {
-                throw new Error(
-                    `Jira ${resourceName} pagination did not advance: requested startAt=${startAt}, ` +
-                    `but the server returned startAt=${String(page.startAt)}.`,
-                );
-            }
-
-            const total = page?.total;
-            if (
-                total !== undefined &&
-                (!Number.isSafeInteger(total) || total < 0)
-            ) {
-                throw new Error(
-                    `Jira ${resourceName} pagination returned an invalid total.`,
-                );
-            }
-
-            if (values.length === 0) {
-                if (page?.isLast === false || (total !== undefined && startAt < total)) {
-                    throw new Error(
-                        `Jira ${resourceName} pagination did not advance: an empty page was ` +
-                        `returned at startAt=${startAt} before all results were retrieved.`,
-                    );
-                }
-                return results;
-            }
-
-            const identifiers = values.map((value) => value?.id ?? value?.key);
-            if (identifiers.every((identifier) =>
-                typeof identifier === "string" || typeof identifier === "number"
-            )) {
-                const signature = JSON.stringify(identifiers);
-                if (seenPageSignatures.has(signature)) {
-                    throw new Error(
-                        `Jira ${resourceName} pagination returned a repeated page at ` +
-                        `startAt=${startAt}; refusing to return duplicated or incomplete data.`,
-                    );
-                }
-                seenPageSignatures.add(signature);
-            }
-
-            results.push(...values);
-            startAt += values.length;
-
-            if (
-                page?.isLast === true ||
-                (total !== undefined && startAt >= total)
-            ) {
-                return results;
-            }
-
-            if (pageNumber === this.maxPaginationPages) {
-                const totalHint = total === undefined ? "" : ` of ${total}`;
-                throw new Error(
-                    `Jira ${resourceName} pagination stopped after the configured limit of ` +
-                    `${this.maxPaginationPages} pages (${results.length}${totalHint} results fetched). ` +
-                    `Narrow the query or cautiously increase ATLASSIAN_MAX_PAGINATION_PAGES; ` +
-                    `partial results were not returned.`,
-                );
-            }
-        }
-
-        // The constructor guarantees a positive page budget, so this can only
-        // be reached if future changes break the pagination invariant.
-        throw new Error(`Jira ${resourceName} pagination ended unexpectedly.`);
+        return await fetchPaginatedJiraValues({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            maxPaginationPages: this.maxPaginationPages,
+            path,
+            itemProperty,
+            maxResults,
+            query,
+            resourceName,
+        });
     }
     /**
      * Lists boards visible to the PAT's owner, optionally filtered by name or

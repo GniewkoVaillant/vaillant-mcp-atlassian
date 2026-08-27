@@ -114,11 +114,25 @@ export async function writeNewAttachment(
     // Validate before mkdir: an outputPath outside the allowlist must never create
     // directories as a side effect. The second call below is the load-bearing one --
     // it re-resolves the path physically once the ancestors exist, so a symlinked
-    // ancestor still trips the verifiedPath !== outputPath check.
-    await assertAttachmentPathAllowed(policy, outputPath, "outputPath");
-    await mkdir(dirname(outputPath), { recursive: true, mode: 0o700 });
+    // ancestor still trips the canonical-path comparison.
+    const expectedPath = await assertAttachmentPathAllowed(policy, outputPath, "outputPath");
+    const resolvedOutputPath = resolve(outputPath);
+    const stablePaths = await Promise.all(
+        (policy.attachmentDirs ?? []).map(async (dir) => {
+            const configuredRoot = resolve(dir);
+            const rel = relative(configuredRoot, resolvedOutputPath);
+            if (rel.startsWith("..") || isAbsolute(rel)) {
+                return null;
+            }
+            return resolve(await realpath(configuredRoot), rel);
+        }),
+    );
+    if (resolvedOutputPath !== expectedPath && !stablePaths.includes(expectedPath)) {
+        throw new Error("Attachment outputPath changed during validation.");
+    }
+    await mkdir(dirname(expectedPath), { recursive: true, mode: 0o700 });
     const verifiedPath = await assertAttachmentPathAllowed(policy, outputPath, "outputPath");
-    if (verifiedPath !== outputPath) {
+    if (verifiedPath !== expectedPath) {
         throw new Error("Attachment outputPath changed during validation.");
     }
     const handle = await open(
@@ -134,21 +148,54 @@ export async function writeNewAttachment(
 }
 
 /**
- * Opens an existing attachment for upload without following symlinks, checks
- * it is a regular file, and enforces the size ceiling both before and after
- * reading it.
+ * Opens an existing attachment for upload without following symlinks. The file
+ * type is checked twice on purpose -- once before open() so a FIFO or device
+ * node can never block the call, and once on the open file descriptor so a path
+ * swapped in after the first check is still caught -- and hard-linked files are
+ * refused because a second name can lead outside the allowlist. The size ceiling
+ * is enforced both before and after reading.
  */
 export async function readExistingAttachment(
     policy: AttachmentPolicy,
     filePath: string,
 ): Promise<{ path: string; data: Buffer }> {
     const safeFilePath = await assertAttachmentPathAllowed(policy, filePath, "filePath", true);
-    const handle = await open(safeFilePath, fileConstants.O_RDONLY | fileConstants.O_NOFOLLOW);
+    // Establish the file type BEFORE open(). O_NOFOLLOW stops symbolic links but
+    // not FIFOs, sockets or device nodes, and open(O_RDONLY) on a FIFO with no
+    // writer blocks in the kernel forever: it pins one libuv threadpool thread,
+    // and four such calls (the default UV_THREADPOOL_SIZE) deadlock every other
+    // filesystem operation in the process. The isFile() check below would catch
+    // it, but it only runs once open() has already returned.
+    const preOpenMetadata = await lstat(safeFilePath);
+    if (!preOpenMetadata.isFile()) {
+        throw new Error("Attachment filePath must point to a regular file.");
+    }
+    // O_NONBLOCK is the second line of defence for the window between the lstat
+    // above and this open(): on a writer-less FIFO it returns immediately instead
+    // of blocking, and on a regular file the flag is inert.
+    const handle = await open(
+        safeFilePath,
+        fileConstants.O_RDONLY | fileConstants.O_NOFOLLOW | fileConstants.O_NONBLOCK,
+    );
     let data: Buffer;
     try {
+        // Deliberately kept even though lstat already ran: this stat() describes the
+        // inode that was actually opened, so it -- not the pre-open lstat -- is what
+        // closes the TOCTOU window if the path was swapped in between.
         const metadata = await handle.stat();
         if (!metadata.isFile()) {
             throw new Error("Attachment filePath must point to a regular file.");
+        }
+        // A hard link is a second name for the same inode, so realpath() and the
+        // allowlist check both see an in-policy path while the bytes may belong to a
+        // file created outside the allowed directories. There is no portable way to
+        // learn the other names, so any extra link is refused.
+        if (metadata.nlink > 1) {
+            throw new Error(
+                `Attachment filePath has ${metadata.nlink} hard links, so the same file ` +
+                    "is also reachable under another name that may sit outside the allowed " +
+                    "directories; refusing to read it.",
+            );
         }
         assertAttachmentSize(policy, metadata.size, "upload size");
         data = await handle.readFile();

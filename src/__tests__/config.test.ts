@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { loadConfig, type ToolGroup } from "../config.js";
+import { ALL_TOOL_GROUPS, loadConfig, type ToolGroup } from "../config.js";
 
 const ENV_FILE = fileURLToPath(new URL("./config-test.env", import.meta.url));
 const ORIGINAL_ENV = { ...process.env };
@@ -82,9 +82,67 @@ ATLASSIAN_TIMEOUT_MS=45000
     assert.equal(config.timeoutMs, 45000);
   });
 
-  test("refuses an environment file readable by other users", { skip: process.platform === "win32" }, () => {
+  test("an empty value in the real environment overrides the .env file instead of falling back to it", () => {
+    writeEnv(`
+JIRA_BASE_URL=https://jira-from-file.example.test
+JIRA_PAT=jira-from-file
+CONFLUENCE_BASE_URL=https://confluence-from-file.example.test
+CONFLUENCE_PAT=confluence-from-file
+ATLASSIAN_ATTACHMENT_DIRS=/srv/attachments
+`);
+    // "Environment=ATLASSIAN_ATTACHMENT_DIRS=" in systemd, "-e ATLASSIAN_ATTACHMENT_DIRS=" in
+    // Docker: an operator switching file access off must not get it switched on.
+    process.env.ATLASSIAN_ATTACHMENT_DIRS = "";
+
+    assert.deepEqual(loadConfig().attachmentDirs, []);
+  });
+
+  test("an empty override of a required value fails closed rather than using the .env value", () => {
+    writeEnv(`
+JIRA_BASE_URL=https://jira-from-file.example.test
+JIRA_PAT=jira-from-file
+CONFLUENCE_BASE_URL=https://confluence-from-file.example.test
+CONFLUENCE_PAT=confluence-from-file
+`);
+    process.env.JIRA_PAT = "";
+
+    assert.throws(() => loadConfig(), /Missing required environment variable\(s\): JIRA_PAT\./);
+  });
+
+  test("empty overrides of optional switches resolve to their documented defaults", () => {
+    writeEnv(`
+JIRA_BASE_URL=https://jira-from-file.example.test
+JIRA_PAT=jira-from-file
+CONFLUENCE_BASE_URL=https://confluence-from-file.example.test
+CONFLUENCE_PAT=confluence-from-file
+ATLASSIAN_PROFILE=core
+ATLASSIAN_READ_ONLY=true
+ATLASSIAN_TIMEOUT_MS=1234
+`);
+    process.env.ATLASSIAN_PROFILE = "";
+    process.env.ATLASSIAN_READ_ONLY = "";
+    process.env.ATLASSIAN_TIMEOUT_MS = "";
+
+    const config = loadConfig();
+
+    assert.deepEqual(groupNames(config.enabledGroups), [...ALL_TOOL_GROUPS].sort());
+    assert.equal(config.readOnly, false);
+    assert.equal(config.timeoutMs, 30_000);
+  });
+
+  test("refuses an environment file readable by other users", { skip: process.platform === "win32" }, (t) => {
     setRequiredEnv();
     chmodSync(ENV_FILE, 0o644);
+
+    // chmod is a no-op on filesystems that do not carry POSIX permission bits
+    // (FUSE mounts, network shares, Windows). Asserting on a mode the
+    // filesystem silently refused to set is the one false alarm this suite
+    // had, so check the effect instead of trusting the call.
+    const groupAndOtherBits = statSync(ENV_FILE).mode & 0o077;
+    if (groupAndOtherBits === 0) {
+      t.skip("filesystem does not honour POSIX permission bits; nothing to detect");
+      return;
+    }
 
     assert.throws(() => loadConfig(), /accessible to other users.*chmod 600/);
   });
@@ -219,6 +277,40 @@ describe("loadConfig scalar parsing", () => {
     assert.equal(configured.maxQueuedRequests, 0);
     assert.equal(configured.maxAttachmentBytes, 4096);
     assert.equal(configured.maxPaginationPages, 3);
+  });
+
+  test("JSON and tool-result budgets default, accept overrides and fail closed on junk", () => {
+    setRequiredEnv();
+    const defaults = loadConfig();
+    assert.equal(defaults.maxJsonBytes, 16 * 1024 * 1024);
+    assert.equal(defaults.maxToolResultBytes, 150_000);
+
+    process.env.ATLASSIAN_MAX_JSON_BYTES = "2048";
+    process.env.ATLASSIAN_MAX_TOOL_RESULT_BYTES = "4096";
+    const configured = loadConfig();
+    assert.equal(configured.maxJsonBytes, 2048);
+    assert.equal(configured.maxToolResultBytes, 4096);
+
+    for (const junk of ["abc", "0", "-1", "1.5"]) {
+      process.env.ATLASSIAN_MAX_JSON_BYTES = junk;
+      assert.throws(() => loadConfig(), /Invalid ATLASSIAN_MAX_JSON_BYTES/);
+    }
+    delete process.env.ATLASSIAN_MAX_JSON_BYTES;
+
+    for (const junk of ["abc", "0", "-1", "1.5"]) {
+      process.env.ATLASSIAN_MAX_TOOL_RESULT_BYTES = junk;
+      assert.throws(() => loadConfig(), /Invalid ATLASSIAN_MAX_TOOL_RESULT_BYTES/);
+    }
+  });
+
+  test("both new budgets reject values above their ceiling", () => {
+    setRequiredEnv();
+    process.env.ATLASSIAN_MAX_JSON_BYTES = String(256 * 1024 * 1024 + 1);
+    assert.throws(() => loadConfig(), /Invalid ATLASSIAN_MAX_JSON_BYTES/);
+
+    delete process.env.ATLASSIAN_MAX_JSON_BYTES;
+    process.env.ATLASSIAN_MAX_TOOL_RESULT_BYTES = String(16 * 1024 * 1024 + 1);
+    assert.throws(() => loadConfig(), /Invalid ATLASSIAN_MAX_TOOL_RESULT_BYTES/);
   });
 
   test("resource limits reject fractional, negative and excessive values", () => {

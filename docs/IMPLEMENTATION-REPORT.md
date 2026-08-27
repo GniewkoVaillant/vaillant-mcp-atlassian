@@ -266,7 +266,9 @@ snapshot.
 | `ATLASSIAN_MAX_CONCURRENT_REQUESTS` | `4` | Shared upstream concurrency |
 | `ATLASSIAN_MAX_QUEUED_REQUESTS` | `16` | Finite waiting queue |
 | `ATLASSIAN_MAX_ATTACHMENT_BYTES` | `10485760` | Attachment maximum size |
-| `ATLASSIAN_MAX_PAGINATION_PAGES` | `10` | Automatic Jira Agile pagination budget |
+| `ATLASSIAN_MAX_PAGINATION_PAGES` | `10` | Automatic pagination budget: Jira Agile, Jira changelog and Confluence |
+| `ATLASSIAN_MAX_JSON_BYTES` | `16777216` | Largest buffered upstream JSON response |
+| `ATLASSIAN_MAX_TOOL_RESULT_BYTES` | `150000` | Tool result ceiling; excess is truncated with a marker |
 | `ATLASSIAN_SMOKE_LIVE` | `false` | Explicit opt-in for authenticated live smoke checks |
 
 ### Verification boundaries

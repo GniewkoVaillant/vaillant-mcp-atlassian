@@ -28,8 +28,11 @@ describe("mapWithConcurrency", () => {
       return item;
     });
 
-    assert.equal(peak <= 2, true);
-    assert.equal(peak, 2);
+    // Only the cap is a contract. Pinning the exact peak also pins the
+    // scheduler: a perfectly correct change in how work is handed out would
+    // fail here for no reason.
+    assert.ok(peak <= 2, `expected at most 2 workers in flight, observed ${peak}`);
+    assert.ok(peak >= 2, "expected the helper to actually run work in parallel");
   });
 
   test("returns an empty array without invoking the worker for empty input", async () => {
