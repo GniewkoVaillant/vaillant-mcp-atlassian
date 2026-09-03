@@ -1090,26 +1090,53 @@ export class ConfluenceClient {
      * Reads the storage-format body of a specific historical version, so an
      * edit can be reviewed or reverted.
      *
-     * `status=any` is used rather than `status=historical`: only the former is
-     * documented for Data Center, and it selects the requested version just as
-     * well when `version` is given.
+     * Two request shapes, because Data Center disagrees with its own reference
+     * here. The documented status values are `any/current/draft/trashed`, and
+     * `any` looked like the safe choice — but a real 8.x instance rejects
+     * `status=any` outright with a 400, while the undocumented
+     * `status=historical` works. So the explicit intent is tried first and the
+     * bare `version=N` form, which also resolves an older version, is the
+     * fallback.
      */
     async getPageVersion(pageId: string, versionNumber: number): Promise<ConfluencePageVersionContent> {
         if (!Number.isSafeInteger(versionNumber) || versionNumber <= 0) {
             throw new Error("versionNumber must be a positive integer.");
         }
-        const page = requireResponseObject(await atlassianGet({
-            baseUrl: this.options.baseUrl,
-            pat: this.options.pat,
-            path: `/rest/api/content/${encodeURIComponent(pageId)}`,
-            query: { status: "any", version: versionNumber, expand: "body.storage,version,space" },
-        }), `version ${versionNumber} response for page ${pageId}`);
+        const expand = "body.storage,version,space";
+        let page: Record<string, any>;
+        try {
+            page = requireResponseObject(await atlassianGet({
+                baseUrl: this.options.baseUrl,
+                pat: this.options.pat,
+                path: `/rest/api/content/${encodeURIComponent(pageId)}`,
+                query: { status: "historical", version: versionNumber, expand },
+            }), `version ${versionNumber} response for page ${pageId}`);
+        } catch (error) {
+            // Only a rejected *request shape* is worth retrying differently; a
+            // 404 means the version does not exist and retrying would mask it.
+            if (!(error instanceof AtlassianHttpError) || error.status !== 400) throw error;
+            page = requireResponseObject(await atlassianGet({
+                baseUrl: this.options.baseUrl,
+                pat: this.options.pat,
+                path: `/rest/api/content/${encodeURIComponent(pageId)}`,
+                query: { version: versionNumber, expand },
+            }), `version ${versionNumber} response for page ${pageId}`);
+        }
         const storage = page.body?.storage?.value || "";
+        const returnedVersion = page.version?.number;
+        // A server that ignores the version parameter would hand back the live
+        // page, and restoring "version 3" would then republish version 7.
+        if (typeof returnedVersion === "number" && returnedVersion !== versionNumber) {
+            throw new Error(
+                `Confluence returned version ${returnedVersion} of page ${pageId} when version ` +
+                `${versionNumber} was requested; refusing to treat it as the requested version.`,
+            );
+        }
         return {
             id: page.id || pageId,
             title: page.title || "",
             space: page.space?.key || "",
-            version: page.version?.number ?? versionNumber,
+            version: returnedVersion ?? versionNumber,
             storage,
             body: storage ? storageToPlainText(storage) : "(no content)",
         };

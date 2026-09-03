@@ -401,13 +401,14 @@ explicit allowlist were called. No issue content, page content, name, key or
 hostname was printed — the probe reports a verdict and a shape, and redacts
 every identifier it discovers.
 
-**51 of 51 endpoints answered correctly** on the live instance, covering every
-new area: metadata and `createmeta`, the dictionaries, project configuration,
-the user and group directory, permissions, filters and dashboards, issue-level
-reads, the agile reads, Jira Service Management, and the whole Confluence
-surface including export, restrictions, labels, properties and trash.
+**51 of 51 endpoints answered correctly** on the live instance in the first run,
+and a follow-up run closed the remaining gap: **62 of the 85 registered
+read-only tools are now verified against the real instance, which is every
+read tool added by this change.** The 23 that remain unverified all predate it
+(`jira_get_issue`, the ProForma tools, worklogs, watchers, dev-status, sprint
+reports, and the original Confluence page reads).
 
-This is what documentation review could not establish, and it found two real
+This is what documentation review could not establish, and it found three real
 defects that no synthetic test would have.
 
 #### Defect 1: board discovery could not discover a board
@@ -428,7 +429,22 @@ the *page size* and then walked to the end of the collection. Asking for 5
 issues on a 292-issue board therefore paged 5 at a time until the page budget
 ran out and failed. A smaller request cost more, which is exactly backwards.
 
-#### The fix
+#### Defect 3: the documented status value is the one that does not work
+
+`getPageVersion` requested a historical page with `status=any`, chosen because
+`any` is the only status value the Data Center reference documents and
+`historical` is not. The live instance **rejects `status=any` with a 400** and
+accepts `status=historical`. Preferring the documented value over the working
+one broke `confluence_get_page_version` outright, and with it
+`confluence_restore_page_version`, which depends on it.
+
+The fix asks for `status=historical` first and falls back to a bare `version=N`
+request, which the instance also accepts. It additionally refuses a response
+whose version number is not the one requested — a server that ignored the
+parameter would otherwise hand back the live page, and "restore version 3"
+would republish version 7.
+
+#### The pagination fix
 
 `fetchPaginatedJiraValues` gained an optional `maxItems` that stops the walk on
 the result count, and now returns `{ values, hasMore, total }` instead of a bare
@@ -437,8 +453,9 @@ array. Page size is decided independently of the caller's window. `listBoards`,
 `returned`, `total` and `hasMore`, so a truncated answer is never mistaken for a
 complete one — the same convention the Confluence list tools already used.
 
-Both defects were then re-verified live: board discovery now answers "5 of 2346,
-hasMore=true" and all four agile reads succeed.
+All three defects were re-verified live after fixing: board discovery answers
+"5 of 2346, hasMore=true", all four agile reads succeed, and
+`confluence_get_page_version` returns the requested version.
 
 ### Testing the tool surface, not just the clients
 
@@ -537,9 +554,9 @@ still announced 1.1.0, so every client logged a version matching no release.
 |---|---|
 | Strict TypeScript check | `tsc -p tsconfig.json --noEmit` passed |
 | Lint | `npx eslint . --max-warnings 91`: 0 errors, 91 warnings — two *below* the pre-existing CI ceiling, which was lowered to match |
-| Unit tests | 513 tests; 498 passed; **0 failed**; 15 skipped, each with a recorded capability reason |
+| Unit tests | 516 tests; 501 passed; **0 failed**; 15 skipped, each with a recorded capability reason |
 | End-to-end tool surface | 29 checks driving the built server over stdio through MCP against a stub Data Center; all pass |
-| **Live read-only verification** | **51 of 51 endpoints answered correctly against the real instance**, under forced read-only mode with an annotation-verified tool set; found and fixed two pagination defects |
+| **Live read-only verification** | **62 of 85 registered read tools verified against the real instance — every read tool this change added.** The 23 unverified all predate it. Found and fixed three defects |
 | Mutation check | 3 deliberate defects injected one at a time, each caught by the intended assertion; all files restored byte-identical |
 | Determinism | The `httpClient` timeout suite was intermittently red — 2 failures across 5 runs, on `main` as well. After the rewrite it passed 8 consecutive runs, then three consecutive full-gate runs |
 | New tests | 65 added across `jiraExtendedClients.test.ts`, `confluenceExtended.test.ts`, `toolSurface.test.ts`, `config.test.ts`, `httpClient.test.ts` and `serverPolicy.test.ts` |
@@ -552,16 +569,20 @@ still announced 1.1.0, so every client logged a version matching no release.
 | `core` profile | 24 tools; approximately 4,900 tokens |
 | Explicit destructive opt-in | 150 tools; 17 destructive tools; approximately 33,500 tokens |
 | Read-only plus destructive opt-in | 85 tools; 0 destructive tools — read-only still wins |
-| Live Jira/Confluence traffic | **Performed, read-only, with explicit authorisation.** 51 read-only endpoints verified against the real instance; no write, delete or modify call was made, and none was even registered |
+| Live Jira/Confluence traffic | **Performed, read-only, with explicit authorisation.** 62 read tools verified against the real instance — every read tool added here. No write, delete or modify call was made, and none was even registered |
 | Deployment | Not performed |
 
 ### Residual risk
 
-The **read** surface is now verified against the real instance: 51 endpoints
-answered correctly. The **write** surface is not, and cannot be without
-authorisation to create real data — every write tool was verified against
-documentation, synthetic servers and the MCP protocol, but never against your
-Jira and Confluence.
+The **read** surface added here is verified against the real instance: every one
+of its read tools answered correctly, and doing so uncovered three defects that
+documentation review and synthetic tests had both missed. That is the strongest
+argument available for why the write surface still needs the same treatment.
+
+The **write** surface is not verified live, and cannot be without authorisation
+to create real data. Every write tool is verified against documentation,
+synthetic servers and the MCP protocol — which is exactly the level of assurance
+the read tools had before live testing found three defects in them.
 
 Before relying on the write tools in anger, exercise the specific ones you
 intend to use on a scratch project and a scratch space — particularly

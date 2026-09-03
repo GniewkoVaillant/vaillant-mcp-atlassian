@@ -48,6 +48,90 @@ function bodyOf(record: RequestRecord | undefined): any {
 const HISTORICAL_STORAGE = '<p>Old text</p><ac:structured-macro ac:name="info"/>';
 
 describe("ConfluenceClient version restore", () => {
+    test("asks for the historical status first, and falls back when it is rejected", async () => {
+        const attempts: string[] = [];
+        await withStubServer(
+            async (req: any, res: any, requests: RequestRecord[]) => {
+                const record = await recordRequest(req, requests);
+                const url = new URL(record.url, "http://127.0.0.1");
+                if (url.pathname === "/rest/api/content/123" && record.method === "GET"
+                    && url.searchParams.get("version") === "3") {
+                    const status = url.searchParams.get("status");
+                    attempts.push(status ?? "(none)");
+                    // A real Data Center 8.x instance rejects `status=any` with
+                    // a 400 while accepting `status=historical`.
+                    if (status === "any") {
+                        sendResponse(res, { status: 400, body: '{"message":"invalid status"}' });
+                        return;
+                    }
+                    sendResponse(res, {
+                        headers: { "content-type": "application/json" },
+                        body: JSON.stringify({
+                            id: "123", title: "Runbook", version: { number: 3 },
+                            body: { storage: { value: HISTORICAL_STORAGE } },
+                        }),
+                    });
+                    return;
+                }
+                sendResponse(res, { status: 404, body: '{"message":"no route"}' });
+            },
+            async (baseUrl) => {
+                const client = new ConfluenceClient({ baseUrl, pat: "test-pat" });
+                const version = await client.getPageVersion("123", 3);
+
+                assert.equal(version.storage, HISTORICAL_STORAGE);
+                assert.deepEqual(attempts, ["historical"], "the working form must be tried first");
+            },
+        );
+    });
+
+    test("falls back to a bare version request when historical is refused", async () => {
+        const attempts: string[] = [];
+        await withStubServer(
+            async (req: any, res: any, requests: RequestRecord[]) => {
+                const record = await recordRequest(req, requests);
+                const url = new URL(record.url, "http://127.0.0.1");
+                const status = url.searchParams.get("status");
+                attempts.push(status ?? "(none)");
+                if (status === "historical") {
+                    sendResponse(res, { status: 400, body: '{"message":"unknown status"}' });
+                    return;
+                }
+                sendResponse(res, {
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({
+                        id: "123", title: "Runbook", version: { number: 3 },
+                        body: { storage: { value: HISTORICAL_STORAGE } },
+                    }),
+                });
+            },
+            async (baseUrl) => {
+                const client = new ConfluenceClient({ baseUrl, pat: "test-pat" });
+                const version = await client.getPageVersion("123", 3);
+
+                assert.equal(version.version, 3);
+                assert.deepEqual(attempts, ["historical", "(none)"]);
+            },
+        );
+    });
+
+    test("refuses a response that is not the version that was asked for", async () => {
+        await withStubServer(
+            routedServer([[
+                (url, method) => url.pathname === "/rest/api/content/123" && method === "GET",
+                // The live page, as a server that ignored `version` would send.
+                { id: "123", title: "Runbook", version: { number: 7 }, body: { storage: { value: "<p>Live</p>" } } },
+            ]]),
+            async (baseUrl) => {
+                const client = new ConfluenceClient({ baseUrl, pat: "test-pat" });
+                await assert.rejects(
+                    () => client.getPageVersion("123", 3),
+                    domainError(/returned version 7.*version 3 was requested/),
+                );
+            },
+        );
+    });
+
     test("republishes the historical storage markup verbatim", async () => {
         await withStubServer(
             routedServer([
