@@ -22,7 +22,7 @@ import {
     atlassianPut,
     AtlassianHttpError,
 } from "./httpClient.js";
-import { requireUpstreamArray, requireUpstreamObject } from "./upstreamShape.js";
+import { requireUpstreamArray, requireUpstreamObject, readArray, readId, readNumber, readString } from "./upstreamShape.js";
 
 /** Gate for a Confluence response envelope; an empty 200 body decodes to `undefined`. */
 function requireResponseObject(value: unknown, description: string): Record<string, any> {
@@ -1009,13 +1009,17 @@ export class ConfluenceClient {
             query: { cql, limit, start, excerpt: "none" },
         }), "global search response");
         const results: ConfluenceSearchHit[] = requireOptionalArray(data.results, "global search result list")
-            .map((item: any) => ({
-                type: item.content?.type || item.entityType || "unknown",
-                id: item.content?.id || "",
-                title: item.title || item.content?.title || "",
-                space: item.resultGlobalContainer?.title || item.content?.space?.key || "",
-                url: buildPageUrl(this.options.baseUrl, item.url || item.content?._links?.webui),
-                lastModified: item.lastModified || "",
+            .map((item: unknown) => ({
+                type: readString(item, "content", "type") || readString(item, "entityType") || "unknown",
+                id: readId(item, "content", "id"),
+                title: readString(item, "title") || readString(item, "content", "title"),
+                space: readString(item, "resultGlobalContainer", "title")
+                    || readString(item, "content", "space", "key"),
+                url: buildPageUrl(
+                    this.options.baseUrl,
+                    readString(item, "url") || readString(item, "content", "_links", "webui"),
+                ),
+                lastModified: readString(item, "lastModified"),
             }));
         const total = typeof data.totalSize === "number" ? data.totalSize : start + results.length;
         const nextStart = start + results.length;
@@ -1039,11 +1043,11 @@ export class ConfluenceClient {
             path: `/rest/api/content/${encodeURIComponent(pageId)}`,
             query: { expand: "ancestors,space" },
         }), `ancestor response for page ${pageId}`);
-        return requireOptionalArray(page.ancestors, `ancestor list on page ${pageId}`).map((ancestor: any) => ({
-            id: ancestor.id,
-            title: ancestor.title || "",
-            space: ancestor.space?.key || page.space?.key || "",
-            url: buildPageUrl(this.options.baseUrl, ancestor._links?.webui),
+        return requireOptionalArray(page.ancestors, `ancestor list on page ${pageId}`).map((ancestor: unknown) => ({
+            id: readId(ancestor, "id"),
+            title: readString(ancestor, "title"),
+            space: readString(ancestor, "space", "key") || readString(page, "space", "key"),
+            url: buildPageUrl(this.options.baseUrl, readString(ancestor, "_links", "webui")),
         }));
     }
 
@@ -1305,11 +1309,7 @@ export class ConfluenceClient {
             pat: this.options.pat,
             path: `/rest/api/content/${encodeURIComponent(pageId)}/label`,
         }), `label list response for page ${pageId}`);
-        return requireOptionalArray(response.results, `label list on page ${pageId}`).map((label: any) => ({
-            name: label?.name || "",
-            prefix: label?.prefix || "global",
-            id: String(label?.id ?? ""),
-        }));
+        return requireOptionalArray(response.results, `label list on page ${pageId}`).map(toLabel);
     }
 
     /** Adds labels to a page. Additive: existing labels are kept. */
@@ -1323,11 +1323,7 @@ export class ConfluenceClient {
             path: `/rest/api/content/${encodeURIComponent(pageId)}/label`,
             body: labels.map((name) => ({ prefix: "global", name })),
         }), `label creation response for page ${pageId}`);
-        return requireOptionalArray(response.results, `label list on page ${pageId}`).map((label: any) => ({
-            name: label?.name || "",
-            prefix: label?.prefix || "global",
-            id: String(label?.id ?? ""),
-        }));
+        return requireOptionalArray(response.results, `label list on page ${pageId}`).map(toLabel);
     }
 
     async removeLabel(pageId: string, label: string): Promise<{ pageId: string; label: string; removed: true }> {
@@ -1361,13 +1357,13 @@ export class ConfluenceClient {
         return Object.entries(response)
             // The map is keyed by operation; `_links`/`_expandable` ride along.
             .filter(([key]) => !key.startsWith("_"))
-            .map(([operation, restriction]: [string, any]) => ({
+            .map(([operation, restriction]: [string, unknown]) => ({
                 operation,
-                users: requireOptionalArray(restriction?.restrictions?.user?.results, "restricted user list")
-                    .map((user: any) => user?.username || user?.displayName || "")
+                users: readArray(restriction, "restrictions", "user", "results")
+                    .map((user: unknown) => readString(user, "username") || readString(user, "displayName"))
                     .filter((name: string) => name !== ""),
-                groups: requireOptionalArray(restriction?.restrictions?.group?.results, "restricted group list")
-                    .map((group: any) => group?.name || "")
+                groups: readArray(restriction, "restrictions", "group", "results")
+                    .map((group: unknown) => readString(group, "name"))
                     .filter((name: string) => name !== ""),
             }))
             // An operation with no users and no groups is unrestricted, which is
@@ -1382,9 +1378,9 @@ export class ConfluenceClient {
             path: `/rest/api/content/${encodeURIComponent(pageId)}/property`,
             query: { expand: "version" },
         }), `property list response for page ${pageId}`);
-        return requireOptionalArray(response.results, `property list on page ${pageId}`).map((property: any) => ({
-            key: property?.key || "",
-            version: property?.version?.number ?? 1,
+        return requireOptionalArray(response.results, `property list on page ${pageId}`).map((property: unknown) => ({
+            key: readString(property, "key"),
+            version: readNumber(property, "version", "number") ?? 1,
         }));
     }
 
@@ -1480,11 +1476,11 @@ export class ConfluenceClient {
             query: { spaceKey, type: "page", status: "trashed", limit, expand: "space" },
         }), `trash listing response for space ${spaceKey}`);
         return requireOptionalArray(response.results, `trash listing for space ${spaceKey}`)
-            .map((page: any) => ({
-                id: page.id,
-                title: page.title || "",
-                space: page.space?.key || spaceKey,
-                url: buildPageUrl(this.options.baseUrl, page._links?.webui),
+            .map((page: unknown) => ({
+                id: readId(page, "id"),
+                title: readString(page, "title"),
+                space: readString(page, "space", "key") || spaceKey,
+                url: buildPageUrl(this.options.baseUrl, readString(page, "_links", "webui")),
             }));
     }
 
@@ -1548,15 +1544,8 @@ export class ConfluenceClient {
             body: form,
         }), `attachment upload response for page ${pageId}`);
         return requireOptionalArray(response.results, `uploaded attachment list for page ${pageId}`)
-            .map((attachment: any) => ({
-                id: attachment.id,
-                title: attachment.title || basename(safeFilePath),
-                mediaType: attachment.metadata?.mediaType || mimeType,
-                fileSize: attachment.extensions?.fileSize ?? data.byteLength,
-                author: attachment.version?.by?.displayName || attachment.version?.by?.username || "Unknown",
-                created: attachment.version?.when || "",
-                downloadPath: attachment._links?.download || "",
-            }));
+            .map((attachment: unknown) =>
+                toUploadedAttachment(attachment, basename(safeFilePath), mimeType, data.byteLength));
     }
 
     /**
@@ -1583,13 +1572,43 @@ export class ConfluenceClient {
             body: form,
         }), `attachment update response for ${attachmentId} on page ${pageId}`);
         return {
-            id: updated.id || attachmentId,
-            title: updated.title || basename(safeFilePath),
-            mediaType: updated.metadata?.mediaType || mimeType,
-            fileSize: updated.extensions?.fileSize ?? data.byteLength,
-            author: updated.version?.by?.displayName || updated.version?.by?.username || "Unknown",
-            created: updated.version?.when || "",
-            downloadPath: updated._links?.download || "",
+            ...toUploadedAttachment(updated, basename(safeFilePath), mimeType, data.byteLength),
+            // The server may answer with only a subset of the attachment bean;
+            // the ID the caller asked us to replace is authoritative.
+            id: readId(updated, "id") || attachmentId,
         };
     }
+}
+
+function toLabel(label: unknown): ConfluenceLabel {
+    return {
+        name: readString(label, "name"),
+        prefix: readString(label, "prefix") || "global",
+        id: readId(label, "id"),
+    };
+}
+
+/**
+ * Maps an attachment bean returned by an upload, falling back to what was
+ * actually sent. Confluence's upload responses vary in how much of the bean
+ * they include, and a caller that just uploaded a file should never be told the
+ * result has no name and zero bytes.
+ */
+function toUploadedAttachment(
+    attachment: unknown,
+    fallbackTitle: string,
+    fallbackMimeType: string,
+    fallbackSize: number,
+): ConfluenceAttachment {
+    return {
+        id: readId(attachment, "id"),
+        title: readString(attachment, "title") || fallbackTitle,
+        mediaType: readString(attachment, "metadata", "mediaType") || fallbackMimeType,
+        fileSize: readNumber(attachment, "extensions", "fileSize") ?? fallbackSize,
+        author: readString(attachment, "version", "by", "displayName")
+            || readString(attachment, "version", "by", "username")
+            || "Unknown",
+        created: readString(attachment, "version", "when"),
+        downloadPath: readString(attachment, "_links", "download"),
+    };
 }

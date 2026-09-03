@@ -16,7 +16,15 @@
  * an agent can actually act on, and caps the option lists it returns.
  */
 import { atlassianDelete, atlassianGet, atlassianPost, atlassianPut, AtlassianHttpError } from "./httpClient.js";
-import { requireUpstreamArray, requireUpstreamObject } from "./upstreamShape.js";
+import {
+    readArray,
+    readBoolean,
+    readId,
+    readPath,
+    readString,
+    requireUpstreamArray,
+    requireUpstreamObject,
+} from "./upstreamShape.js";
 
 export interface JiraMetaClientOptions {
     baseUrl: string;
@@ -31,20 +39,26 @@ export interface JiraMetaClientOptions {
  */
 const MAX_ALLOWED_VALUES = 50;
 
-function requireArray(value: unknown, description: string): any[] {
+function requireArray(value: unknown, description: string): unknown[] {
     return requireUpstreamArray("Jira", value, description);
 }
 
-function requireObject(value: unknown, description: string): Record<string, any> {
+function requireObject(value: unknown, description: string): Record<string, unknown> {
     return requireUpstreamObject("Jira", value, description);
 }
 
 /** Human-usable label for an allowed-value entry, whatever shape Jira used. */
-function allowedValueLabel(value: any): string | null {
+function allowedValueLabel(value: unknown): string | null {
     if (value === null || value === undefined) return null;
     if (typeof value === "string") return value;
-    const label = value.name ?? value.value ?? value.label ?? value.key ?? value.id;
-    return typeof label === "string" || typeof label === "number" ? String(label) : null;
+    // Jira labels an option differently per field type: a component has a
+    // `name`, a select option a `value`, a cascading option a `label`.
+    const label = readString(value, "name")
+        || readString(value, "value")
+        || readString(value, "label")
+        || readString(value, "key")
+        || readId(value, "id");
+    return label === "" ? null : label;
 }
 
 export interface JiraFieldMeta {
@@ -64,22 +78,22 @@ export interface JiraFieldMeta {
 }
 
 /** Reduces one Jira field-meta object to the parts a caller can act on. */
-function toFieldMeta(fieldId: string, meta: any): JiraFieldMeta {
-    const rawAllowed = Array.isArray(meta?.allowedValues) ? meta.allowedValues : [];
-    const labels = rawAllowed
+function toFieldMeta(fieldId: string, meta: unknown): JiraFieldMeta {
+    const labels = readArray(meta, "allowedValues")
         .map(allowedValueLabel)
         .filter((label: string | null): label is string => label !== null);
+    const schemaItems = readString(meta, "schema", "items");
+    const custom = readString(meta, "schema", "custom");
     return {
         id: fieldId,
-        name: meta?.name || fieldId,
-        required: meta?.required === true,
-        schemaType: meta?.schema?.type || "",
-        schemaItems: meta?.schema?.items ?? null,
-        custom: meta?.schema?.custom ?? null,
-        operations: Array.isArray(meta?.operations)
-            ? meta.operations.filter((operation: unknown) => typeof operation === "string")
-            : [],
-        hasDefaultValue: meta?.hasDefaultValue === true,
+        name: readString(meta, "name") || fieldId,
+        required: readBoolean(meta, "required"),
+        schemaType: readString(meta, "schema", "type"),
+        schemaItems: schemaItems === "" ? null : schemaItems,
+        custom: custom === "" ? null : custom,
+        operations: readArray(meta, "operations")
+            .filter((operation: unknown): operation is string => typeof operation === "string"),
+        hasDefaultValue: readBoolean(meta, "hasDefaultValue"),
         allowedValues: labels.slice(0, MAX_ALLOWED_VALUES),
         allowedValuesTruncated: labels.length > MAX_ALLOWED_VALUES,
     };
@@ -196,7 +210,7 @@ export class JiraMetaClient {
         this.options = options;
     }
 
-    private get<T = any>(path: string, query?: Record<string, string | number | boolean | undefined>): Promise<T> {
+    private get<T = unknown>(path: string, query?: Record<string, string | number | boolean | undefined>): Promise<T> {
         return atlassianGet<T>({ baseUrl: this.options.baseUrl, pat: this.options.pat, path, query });
     }
 
@@ -209,14 +223,13 @@ export class JiraMetaClient {
     async listFields(query?: string, limit?: number): Promise<JiraFieldDefinition[]> {
         const fields = await this.get("/rest/api/2/field");
         const normalized = query?.trim().toLowerCase();
-        const mapped = requireArray(fields, "field catalogue").map((field: any) => ({
-            id: typeof field?.id === "string" ? field.id : String(field?.id ?? ""),
-            name: field?.name || "",
-            custom: field?.custom === true,
-            schemaType: field?.schema?.type || "",
-            clauseNames: Array.isArray(field?.clauseNames)
-                ? field.clauseNames.filter((clause: unknown) => typeof clause === "string")
-                : [],
+        const mapped = requireArray(fields, "field catalogue").map((field: unknown) => ({
+            id: readId(field, "id"),
+            name: readString(field, "name"),
+            custom: readBoolean(field, "custom"),
+            schemaType: readString(field, "schema", "type"),
+            clauseNames: readArray(field, "clauseNames")
+                .filter((clause: unknown): clause is string => typeof clause === "string"),
         }));
         const matched = normalized
             ? mapped.filter((field) =>
@@ -257,17 +270,17 @@ export class JiraMetaClient {
             );
             return {
                 source: "createmeta",
-                projects: requireArray(response.projects, "create metadata project list").map((project: any) => ({
-                    id: String(project?.id ?? ""),
-                    key: project?.key || "",
-                    name: project?.name || "",
-                    issueTypes: requireArray(project?.issuetypes, "create metadata issue type list")
-                        .map((issueType: any) => ({
-                            id: String(issueType?.id ?? ""),
-                            name: issueType?.name || "",
-                            subtask: issueType?.subtask === true,
+                projects: requireArray(response.projects, "create metadata project list").map((project: unknown) => ({
+                    id: readId(project, "id"),
+                    key: readString(project, "key"),
+                    name: readString(project, "name"),
+                    issueTypes: readArray(project, "issuetypes")
+                        .map((issueType: unknown) => ({
+                            id: readId(issueType, "id"),
+                            name: readString(issueType, "name"),
+                            subtask: readBoolean(issueType, "subtask"),
                             fields: includeFields
-                                ? toFieldMetaList(issueType?.fields, "create metadata field map")
+                                ? toFieldMetaList(readPath(issueType, "fields"), "create metadata field map")
                                 : [],
                         })),
                 })),
@@ -305,9 +318,9 @@ export class JiraMetaClient {
             );
             const issueTypes: JiraCreateMetaIssueType[] = [];
             for (const issueType of requireArray(typesResponse.values, `issue type list for project ${projectKey}`)) {
-                const name = issueType?.name || "";
+                const name = readString(issueType, "name");
                 if (wanted && !wanted.includes(name.toLowerCase())) continue;
-                const id = String(issueType?.id ?? "");
+                const id = readId(issueType, "id");
                 let fields: JiraFieldMeta[] = [];
                 if (includeFields && id) {
                     const fieldResponse = requireObject(
@@ -321,9 +334,10 @@ export class JiraMetaClient {
                     // objects that carry their own `fieldId`, not the keyed map
                     // the legacy endpoint used.
                     fields = requireArray(fieldResponse.values, `field list for ${projectKey}/${id}`)
-                        .map((field: any) => toFieldMeta(field?.fieldId || field?.key || "", field));
+                        .map((field: unknown) =>
+                            toFieldMeta(readString(field, "fieldId") || readString(field, "key"), field));
                 }
-                issueTypes.push({ id, name, subtask: issueType?.subtask === true, fields });
+                issueTypes.push({ id, name, subtask: readBoolean(issueType, "subtask"), fields });
             }
             projects.push({ id: "", key: projectKey, name: "", issueTypes });
         }
@@ -345,10 +359,10 @@ export class JiraMetaClient {
 
     private async listNamedEntities(path: string, description: string): Promise<JiraNamedEntity[]> {
         const values = await this.get(path);
-        return requireArray(values, description).map((entity: any) => ({
-            id: String(entity?.id ?? ""),
-            name: entity?.name || "",
-            description: entity?.description || "",
+        return requireArray(values, description).map((entity: unknown) => ({
+            id: readId(entity, "id"),
+            name: readString(entity, "name"),
+            description: readString(entity, "description"),
         }));
     }
 
@@ -373,42 +387,37 @@ export class JiraMetaClient {
             await this.get(`/rest/api/2/project/${encodeURIComponent(projectKey)}`),
             `project ${projectKey} response`,
         );
+        const projectKeyOrFallback = readString(project, "key") || projectKey;
         return {
-            id: String(project.id ?? ""),
-            key: project.key || projectKey,
-            name: project.name || "",
-            description: project.description || "",
-            lead: project.lead?.displayName || project.lead?.name || "",
-            projectTypeKey: project.projectTypeKey || "",
-            url: `${this.options.baseUrl}/browse/${project.key || projectKey}`,
+            id: readId(project, "id"),
+            key: projectKeyOrFallback,
+            name: readString(project, "name"),
+            description: readString(project, "description"),
+            lead: readString(project, "lead", "displayName") || readString(project, "lead", "name"),
+            projectTypeKey: readString(project, "projectTypeKey"),
+            url: `${this.options.baseUrl}/browse/${projectKeyOrFallback}`,
             issueTypes: requireArray(project.issueTypes, `issue type list on project ${projectKey}`)
-                .map((issueType: any) => ({
-                    id: String(issueType?.id ?? ""),
-                    name: issueType?.name || "",
-                    subtask: issueType?.subtask === true,
+                .map((issueType: unknown) => ({
+                    id: readId(issueType, "id"),
+                    name: readString(issueType, "name"),
+                    subtask: readBoolean(issueType, "subtask"),
                 })),
             components: requireArray(project.components, `component list on project ${projectKey}`)
-                .map((component: any) => component?.name || "")
+                .map((component: unknown) => readString(component, "name"))
                 .filter((name: string) => name !== ""),
             versions: requireArray(project.versions, `version list on project ${projectKey}`)
-                .map((version: any) => ({
-                    id: String(version?.id ?? ""),
-                    name: version?.name || "",
-                    released: version?.released === true,
-                    archived: version?.archived === true,
+                .map((version: unknown) => ({
+                    id: readId(version, "id"),
+                    name: readString(version, "name"),
+                    released: readBoolean(version, "released"),
+                    archived: readBoolean(version, "archived"),
                 })),
         };
     }
 
     async listProjectComponents(projectKey: string): Promise<JiraComponentSummary[]> {
         const components = await this.get(`/rest/api/2/project/${encodeURIComponent(projectKey)}/components`);
-        return requireArray(components, `component list for project ${projectKey}`).map((component: any) => ({
-            id: String(component?.id ?? ""),
-            name: component?.name || "",
-            description: component?.description || "",
-            lead: component?.lead?.displayName || component?.lead?.name || "",
-            assigneeType: component?.assigneeType || "",
-        }));
+        return requireArray(components, `component list for project ${projectKey}`).map(toComponentSummary);
     }
 
     async listProjectVersions(projectKey: string): Promise<JiraVersionSummary[]> {
@@ -421,13 +430,13 @@ export class JiraMetaClient {
         { issueType: string; statuses: { id: string; name: string; category: string }[] }[]
     > {
         const response = await this.get(`/rest/api/2/project/${encodeURIComponent(projectKey)}/statuses`);
-        return requireArray(response, `status list for project ${projectKey}`).map((issueType: any) => ({
-            issueType: issueType?.name || "",
-            statuses: requireArray(issueType?.statuses, `status list for issue type on project ${projectKey}`)
-                .map((status: any) => ({
-                    id: String(status?.id ?? ""),
-                    name: status?.name || "",
-                    category: status?.statusCategory?.name || "",
+        return requireArray(response, `status list for project ${projectKey}`).map((issueType: unknown) => ({
+            issueType: readString(issueType, "name"),
+            statuses: readArray(issueType, "statuses")
+                .map((status: unknown) => ({
+                    id: readId(status, "id"),
+                    name: readString(status, "name"),
+                    category: readString(status, "statusCategory", "name"),
                 })),
         }));
     }
@@ -456,19 +465,19 @@ export class JiraMetaClient {
             "JQL autocomplete response",
         );
         return {
-            visibleFieldNames: requireArray(response.visibleFieldNames, "JQL field list").map((field: any) => ({
-                value: field?.value || "",
-                displayName: field?.displayName || "",
-                operators: requireArray(field?.operators, "JQL operator list"),
-                types: requireArray(field?.types, "JQL type list"),
+            visibleFieldNames: requireArray(response.visibleFieldNames, "JQL field list").map((field: unknown) => ({
+                value: readString(field, "value"),
+                displayName: readString(field, "displayName"),
+                operators: readArray(field, "operators").filter(isString),
+                types: readArray(field, "types").filter(isString),
             })),
             visibleFunctionNames: requireArray(response.visibleFunctionNames, "JQL function list")
-                .map((fn: any) => ({
-                    value: fn?.value || "",
-                    displayName: fn?.displayName || "",
-                    types: requireArray(fn?.types, "JQL function type list"),
+                .map((fn: unknown) => ({
+                    value: readString(fn, "value"),
+                    displayName: readString(fn, "displayName"),
+                    types: readArray(fn, "types").filter(isString),
                 })),
-            jqlReservedWords: requireArray(response.jqlReservedWords, "JQL reserved word list"),
+            jqlReservedWords: requireArray(response.jqlReservedWords, "JQL reserved word list").filter(isString),
         };
     }
 
@@ -478,9 +487,9 @@ export class JiraMetaClient {
             await this.get("/rest/api/2/jql/autocompletedata/suggestions", { fieldName, fieldValue }),
             `JQL suggestion response for field ${fieldName}`,
         );
-        return requireArray(response.results, `JQL suggestion list for field ${fieldName}`).map((result: any) => ({
-            value: result?.value || "",
-            displayName: result?.displayName || "",
+        return requireArray(response.results, `JQL suggestion list for field ${fieldName}`).map((result: unknown) => ({
+            value: readString(result, "value"),
+            displayName: readString(result, "displayName"),
         }));
     }
 
@@ -495,13 +504,14 @@ export class JiraMetaClient {
             "current user response",
         );
         return {
-            name: user.name || user.key || "",
-            displayName: user.displayName || "",
-            emailAddress: user.emailAddress || "",
+            name: readString(user, "name") || readString(user, "key"),
+            displayName: readString(user, "displayName"),
+            emailAddress: readString(user, "emailAddress"),
+            // Absent means active: only an explicit `false` deactivates.
             active: user.active !== false,
-            timeZone: user.timeZone || "",
-            groups: requireArray(user.groups?.items, "current user group list")
-                .map((group: any) => group?.name || "")
+            timeZone: readString(user, "timeZone"),
+            groups: readArray(user, "groups", "items")
+                .map((group: unknown) => readString(group, "name"))
                 .filter((name: string) => name !== ""),
         };
     }
@@ -623,25 +633,30 @@ export class JiraMetaClient {
     }
 }
 
-function toVersionSummary(version: any): JiraVersionSummary {
+/** Narrowing predicate for the string lists Jira returns inside JQL metadata. */
+function isString(value: unknown): value is string {
+    return typeof value === "string";
+}
+
+function toVersionSummary(version: unknown): JiraVersionSummary {
     return {
-        id: String(version?.id ?? ""),
-        name: version?.name || "",
-        description: version?.description || "",
-        released: version?.released === true,
-        archived: version?.archived === true,
-        startDate: version?.startDate || "",
-        releaseDate: version?.releaseDate || "",
-        overdue: version?.overdue === true,
+        id: readId(version, "id"),
+        name: readString(version, "name"),
+        description: readString(version, "description"),
+        released: readBoolean(version, "released"),
+        archived: readBoolean(version, "archived"),
+        startDate: readString(version, "startDate"),
+        releaseDate: readString(version, "releaseDate"),
+        overdue: readBoolean(version, "overdue"),
     };
 }
 
-function toComponentSummary(component: any): JiraComponentSummary {
+function toComponentSummary(component: unknown): JiraComponentSummary {
     return {
-        id: String(component?.id ?? ""),
-        name: component?.name || "",
-        description: component?.description || "",
-        lead: component?.lead?.displayName || component?.lead?.name || "",
-        assigneeType: component?.assigneeType || "",
+        id: readId(component, "id"),
+        name: readString(component, "name"),
+        description: readString(component, "description"),
+        lead: readString(component, "lead", "displayName") || readString(component, "lead", "name"),
+        assigneeType: readString(component, "assigneeType"),
     };
 }

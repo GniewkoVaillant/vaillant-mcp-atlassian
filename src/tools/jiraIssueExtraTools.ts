@@ -101,11 +101,13 @@ export function registerJiraIssueExtraTools(tool: ToolRegistrar, client: JiraCli
             toAssignee: z.boolean().optional().describe("Also notify the issue's assignee"),
             toWatchers: z.boolean().optional().describe("Also notify everyone watching the issue"),
         },
-        validate: ({ toUsernames, toGroups, toReporter, toAssignee, toWatchers }) =>
-            !toUsernames?.length && !toGroups?.length && !toReporter && !toAssignee && !toWatchers
+        validate: ({ toUsernames, toGroups, toReporter, toAssignee, toWatchers }) => {
+            const named = (value: unknown) => Array.isArray(value) && value.length > 0;
+            return !named(toUsernames) && !named(toGroups) && !toReporter && !toAssignee && !toWatchers
                 ? "no recipients — supply at least one of: toUsernames, toGroups, toReporter, " +
                   "toAssignee, toWatchers."
-                : undefined,
+                : undefined;
+        },
     }, async ({ issueKey, ...options }) =>
         runTool("jira_notify_issue", () => client.notifyIssue(issueKey, options)));
 

@@ -12,7 +12,14 @@
  * failing outright on whichever version the instance happens to run.
  */
 import { atlassianDelete, atlassianGet, atlassianPost, atlassianPut, AtlassianHttpError } from "./httpClient.js";
-import { requireUpstreamArray, requireUpstreamObject } from "./upstreamShape.js";
+import {
+    readBoolean,
+    readId,
+    readPath,
+    readString,
+    requireUpstreamArray,
+    requireUpstreamObject,
+} from "./upstreamShape.js";
 
 export interface JiraFilterClientOptions {
     baseUrl: string;
@@ -26,11 +33,11 @@ function clampLimit(limit: number | undefined, fallback = 25): number {
     return Math.min(Math.floor(limit), MAX_FILTER_RESULTS);
 }
 
-function requireArray(value: unknown, description: string): any[] {
+function requireArray(value: unknown, description: string): unknown[] {
     return requireUpstreamArray("Jira", value, description);
 }
 
-function requireObject(value: unknown, description: string): Record<string, any> {
+function requireObject(value: unknown, description: string): Record<string, unknown> {
     return requireUpstreamObject("Jira", value, description);
 }
 
@@ -66,18 +73,20 @@ export interface JiraFilterDeleteResult {
 }
 
 /** Renders one share permission as something a person can read. */
-function describeShare(permission: any): string {
-    const type = permission?.type || "unknown";
+function describeShare(permission: unknown): string {
+    const type = readString(permission, "type") || "unknown";
     switch (type) {
         case "group":
-            return `group:${permission?.group?.name || permission?.groupname || "?"}`;
+            return `group:${readString(permission, "group", "name") || readString(permission, "groupname") || "?"}`;
         case "project": {
-            const project = permission?.project?.key || permission?.project?.name || "?";
-            const role = permission?.role?.name;
+            const project = readString(permission, "project", "key")
+                || readString(permission, "project", "name")
+                || "?";
+            const role = readString(permission, "role", "name");
             return role ? `project:${project}/role:${role}` : `project:${project}`;
         }
         case "user":
-            return `user:${permission?.user?.name || permission?.user?.displayName || "?"}`;
+            return `user:${readString(permission, "user", "name") || readString(permission, "user", "displayName") || "?"}`;
         case "global":
             return "global (anyone who can log in)";
         case "authenticated":
@@ -87,16 +96,27 @@ function describeShare(permission: any): string {
     }
 }
 
-function toFilterSummary(baseUrl: string, filter: any): JiraFilterSummary {
-    const id = String(filter?.id ?? "");
+function toSharePermission(permission: unknown): JiraFilterPermission {
+    return {
+        id: readId(permission, "id"),
+        type: readString(permission, "type"),
+        target: describeShare(permission),
+    };
+}
+
+function toFilterSummary(baseUrl: string, filter: unknown): JiraFilterSummary {
+    const id = readId(filter, "id");
     return {
         id,
-        name: filter?.name || "",
-        description: filter?.description || "",
-        owner: filter?.owner?.displayName || filter?.owner?.name || "",
-        jql: filter?.jql || "",
-        favourite: filter?.favourite === true,
-        sharedWith: requireArray(filter?.sharePermissions, "filter share permission list").map(describeShare),
+        name: readString(filter, "name"),
+        description: readString(filter, "description"),
+        owner: readString(filter, "owner", "displayName") || readString(filter, "owner", "name"),
+        jql: readString(filter, "jql"),
+        favourite: readBoolean(filter, "favourite"),
+        sharedWith: requireArray(
+            readPath(filter, "sharePermissions"),
+            "filter share permission list",
+        ).map(describeShare),
         url: id ? `${baseUrl}/issues/?filter=${encodeURIComponent(id)}` : "",
     };
 }
@@ -108,7 +128,7 @@ export class JiraFilterClient {
         this.options = options;
     }
 
-    private get<T = any>(path: string, query?: Record<string, string | number | boolean | undefined>): Promise<T> {
+    private get<T = unknown>(path: string, query?: Record<string, string | number | boolean | undefined>): Promise<T> {
         return atlassianGet<T>({ baseUrl: this.options.baseUrl, pat: this.options.pat, path, query });
     }
 
@@ -180,11 +200,8 @@ export class JiraFilterClient {
 
     async getFilterPermissions(filterId: string): Promise<JiraFilterPermission[]> {
         const permissions = await this.get(`/rest/api/2/filter/${encodeURIComponent(filterId)}/permission`);
-        return requireArray(permissions, `share permission list for filter ${filterId}`).map((permission: any) => ({
-            id: String(permission?.id ?? ""),
-            type: permission?.type || "",
-            target: describeShare(permission),
-        }));
+        return requireArray(permissions, `share permission list for filter ${filterId}`)
+            .map(toSharePermission);
     }
 
     /**
@@ -293,11 +310,8 @@ export class JiraFilterClient {
             path: `/rest/api/2/filter/${encodeURIComponent(filterId)}/permission`,
             body,
         });
-        return requireArray(permissions, `share permission list for filter ${filterId}`).map((permission: any) => ({
-            id: String(permission?.id ?? ""),
-            type: permission?.type || "",
-            target: describeShare(permission),
-        }));
+        return requireArray(permissions, `share permission list for filter ${filterId}`)
+            .map(toSharePermission);
     }
 
     async deleteFilterPermission(filterId: string, permissionId: string): Promise<JiraFilterDeleteResult> {
@@ -364,11 +378,11 @@ export class JiraFilterClient {
     }
 }
 
-function toDashboardSummary(dashboard: any): JiraDashboardSummary {
+function toDashboardSummary(dashboard: unknown): JiraDashboardSummary {
     return {
-        id: String(dashboard?.id ?? ""),
-        name: dashboard?.name || "",
-        owner: dashboard?.owner?.displayName || dashboard?.owner?.name || "",
-        view: dashboard?.view || "",
+        id: readId(dashboard, "id"),
+        name: readString(dashboard, "name"),
+        owner: readString(dashboard, "owner", "displayName") || readString(dashboard, "owner", "name"),
+        view: readString(dashboard, "view"),
     };
 }

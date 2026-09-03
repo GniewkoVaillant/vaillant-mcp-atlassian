@@ -311,15 +311,26 @@ pagination safety, MCP tool exposure, and the version-dependent Data Center
 fallbacks (`createmeta`, filter search, filter favourites). Never place real
 PATs in fixtures.
 
-A few filesystem-safety tests need primitives Windows does not always provide —
-creating a symlink requires Developer Mode or elevation, and NTFS has no POSIX
-mode bits. Those tests are gated on a runtime capability probe
-(`SKIP_WITHOUT_SYMLINKS`, `SKIP_WITHOUT_POSIX_MODES` in
-`src/__tests__/testServer.ts`) rather than weakened, so they run in full on CI
-and on any developer machine that supports them. Five remaining tests (FIFO,
-unix domain socket and character-device refusal, colon-delimited path parsing)
-are POSIX-only by nature and still fail on Windows; treat a Windows run as a
-partial gate and Linux/CI as the authoritative one.
+New Data Center response parsing must go through the typed readers in
+`upstreamShape.ts` (`readString`, `readId`, `readNumber`, `readArray`,
+`readBoolean`) rather than `any`. They keep the tolerance an on-prem payload
+needs — an absent field is still just absent — while letting the compiler check
+what happens to a value once it has been narrowed. CI enforces a descending
+`--max-warnings` ceiling on the remaining `any`-based layer; adding to it will
+fail the build.
+
+A few filesystem-safety tests need primitives that only exist on POSIX: FIFOs,
+unix domain sockets bound to a path, character devices, symlinks, and mode bits.
+Those tests are gated on runtime capability probes (`SKIP_WITHOUT_FIFO`,
+`SKIP_WITHOUT_UNIX_SOCKETS`, `SKIP_WITHOUT_CHARACTER_DEVICES`,
+`SKIP_WITHOUT_SYMLINKS`, `SKIP_WITHOUT_POSIX_MODES` in
+`src/__tests__/testServer.ts`) rather than weakened, so on CI — where every
+primitive exists — every one of them runs, and where one cannot exist the test
+records why it was skipped. The production guards they cover are unaffected:
+the code still refuses non-regular files everywhere, there is simply no way to
+construct one on Windows.
+
+The full gate passes with zero failures on both platforms.
 
 Ordinary `npm run test:smoke` and `npm test` never contact upstream products.
 Run `ATLASSIAN_SMOKE_LIVE=true npm run test:smoke` only after explicitly

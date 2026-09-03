@@ -12,7 +12,16 @@
  * header only opts into the API surface; it grants no additional permission.
  */
 import { atlassianGet, atlassianPost } from "./httpClient.js";
-import { requireUpstreamArray, requireUpstreamObject } from "./upstreamShape.js";
+import {
+    readArray,
+    readBoolean,
+    readId,
+    readNumber,
+    readPath,
+    readString,
+    requireUpstreamArray,
+    requireUpstreamObject,
+} from "./upstreamShape.js";
 
 export interface JiraServiceDeskClientOptions {
     baseUrl: string;
@@ -29,11 +38,11 @@ function clampLimit(limit: number | undefined, fallback = 25): number {
     return Math.min(Math.floor(limit), MAX_SERVICE_DESK_RESULTS);
 }
 
-function requireArray(value: unknown, description: string): any[] {
+function requireArray(value: unknown, description: string): unknown[] {
     return requireUpstreamArray("Jira", value, description);
 }
 
-function requireObject(value: unknown, description: string): Record<string, any> {
+function requireObject(value: unknown, description: string): Record<string, unknown> {
     return requireUpstreamObject("Jira", value, description);
 }
 
@@ -99,7 +108,7 @@ export class JiraServiceDeskClient {
         this.options = options;
     }
 
-    private get<T = any>(path: string, query?: Record<string, string | number | boolean | undefined>): Promise<T> {
+    private get<T = unknown>(path: string, query?: Record<string, string | number | boolean | undefined>): Promise<T> {
         return atlassianGet<T>({
             baseUrl: this.options.baseUrl,
             pat: this.options.pat,
@@ -109,7 +118,7 @@ export class JiraServiceDeskClient {
         });
     }
 
-    private post<T = any>(path: string, body: unknown): Promise<T> {
+    private post<T = unknown>(path: string, body: unknown): Promise<T> {
         return atlassianPost<T>({
             baseUrl: this.options.baseUrl,
             pat: this.options.pat,
@@ -125,10 +134,10 @@ export class JiraServiceDeskClient {
             await this.get("/rest/servicedeskapi/servicedesk", { limit: clampLimit(limit) }),
             "service desk list response",
         );
-        return requireArray(response.values, "service desk list").map((desk: any) => ({
-            id: String(desk?.id ?? ""),
-            projectKey: desk?.projectKey || "",
-            projectName: desk?.projectName || "",
+        return requireArray(response.values, "service desk list").map((desk: unknown) => ({
+            id: readId(desk, "id"),
+            projectKey: readString(desk, "projectKey"),
+            projectName: readString(desk, "projectName"),
         }));
     }
 
@@ -146,11 +155,11 @@ export class JiraServiceDeskClient {
             `request type list response for service desk ${serviceDeskId}`,
         );
         return requireArray(response.values, `request type list for service desk ${serviceDeskId}`)
-            .map((type: any) => ({
-                id: String(type?.id ?? ""),
-                name: type?.name || "",
-                description: type?.description || "",
-                groupIds: requireArray(type?.groupIds, "request type group list").map(String),
+            .map((type: unknown) => ({
+                id: readId(type, "id"),
+                name: readString(type, "name"),
+                description: readString(type, "description"),
+                groupIds: readArray(type, "groupIds").map((groupId) => String(groupId)),
             }));
     }
 
@@ -169,13 +178,13 @@ export class JiraServiceDeskClient {
             ),
             `request type field response for ${serviceDeskId}/${requestTypeId}`,
         );
-        return requireArray(response.requestTypeFields, "request type field list").map((field: any) => ({
-            fieldId: field?.fieldId || "",
-            name: field?.name || "",
-            required: field?.required === true,
-            jiraSchemaType: field?.jiraSchema?.type || "",
-            validValues: requireArray(field?.validValues, "request type field value list")
-                .map((value: any) => value?.label || value?.value || "")
+        return requireArray(response.requestTypeFields, "request type field list").map((field: unknown) => ({
+            fieldId: readString(field, "fieldId"),
+            name: readString(field, "name"),
+            required: readBoolean(field, "required"),
+            jiraSchemaType: readString(field, "jiraSchema", "type"),
+            validValues: readArray(field, "validValues")
+                .map((value: unknown) => readString(value, "label") || readString(value, "value"))
                 .filter((label: string) => label !== ""),
         }));
     }
@@ -216,10 +225,10 @@ export class JiraServiceDeskClient {
             ),
             `queue list response for service desk ${serviceDeskId}`,
         );
-        return requireArray(response.values, `queue list for service desk ${serviceDeskId}`).map((queue: any) => ({
-            id: String(queue?.id ?? ""),
-            name: queue?.name || "",
-            issueCount: typeof queue?.issueCount === "number" ? queue.issueCount : null,
+        return requireArray(response.values, `queue list for service desk ${serviceDeskId}`).map((queue: unknown) => ({
+            id: readId(queue, "id"),
+            name: readString(queue, "name"),
+            issueCount: readNumber(queue, "issueCount"),
         }));
     }
 
@@ -232,16 +241,20 @@ export class JiraServiceDeskClient {
             await this.get(`/rest/servicedeskapi/request/${encodeURIComponent(issueKey)}/sla`),
             `SLA response for request ${issueKey}`,
         );
-        return requireArray(response.values, `SLA list for request ${issueKey}`).map((sla: any) => {
-            const ongoing = sla?.ongoingCycle;
-            const completed = requireArray(sla?.completedCycles, "completed SLA cycle list");
+        return requireArray(response.values, `SLA list for request ${issueKey}`).map((sla: unknown) => {
+            const ongoing = readPath(sla, "ongoingCycle");
+            const completed = readArray(sla, "completedCycles");
+            // A finished SLA has no ongoing cycle, so its verdict lives in the
+            // last completed one. Reading only the ongoing cycle would report
+            // every closed request as unbreached.
             const latest = completed[completed.length - 1];
             return {
-                name: sla?.name || "",
-                ongoing: Boolean(ongoing),
-                breached: (ongoing?.breached ?? latest?.breached) === true,
-                remainingTime: ongoing?.remainingTime?.friendly || "",
-                goalDuration: (ongoing?.goalDuration ?? latest?.goalDuration)?.friendly || "",
+                name: readString(sla, "name"),
+                ongoing: ongoing !== undefined && ongoing !== null,
+                breached: readBoolean(ongoing, "breached") || readBoolean(latest, "breached"),
+                remainingTime: readString(ongoing, "remainingTime", "friendly"),
+                goalDuration: readString(ongoing, "goalDuration", "friendly")
+                    || readString(latest, "goalDuration", "friendly"),
             };
         });
     }
@@ -251,14 +264,15 @@ export class JiraServiceDeskClient {
             await this.get(`/rest/servicedeskapi/request/${encodeURIComponent(issueKey)}/approval`),
             `approval response for request ${issueKey}`,
         );
-        return requireArray(response.values, `approval list for request ${issueKey}`).map((approval: any) => ({
-            id: String(approval?.id ?? ""),
-            name: approval?.name || "",
-            state: approval?.finalDecision || "pending",
-            canAnswer: approval?.canAnswerApproval === true,
-            approvers: requireArray(approval?.approvers, "approver list").map((approver: any) => ({
-                name: approver?.approver?.name || approver?.approver?.displayName || "",
-                decision: approver?.approverDecision || "pending",
+        return requireArray(response.values, `approval list for request ${issueKey}`).map((approval: unknown) => ({
+            id: readId(approval, "id"),
+            name: readString(approval, "name"),
+            state: readString(approval, "finalDecision") || "pending",
+            canAnswer: readBoolean(approval, "canAnswerApproval"),
+            approvers: readArray(approval, "approvers").map((approver: unknown) => ({
+                name: readString(approver, "approver", "name")
+                    || readString(approver, "approver", "displayName"),
+                decision: readString(approver, "approverDecision") || "pending",
             })),
         }));
     }
@@ -272,13 +286,7 @@ export class JiraServiceDeskClient {
             }),
             `comment response for request ${issueKey}`,
         );
-        return requireArray(response.values, `comment list for request ${issueKey}`).map((comment: any) => ({
-            id: String(comment?.id ?? ""),
-            author: comment?.author?.displayName || comment?.author?.name || "",
-            body: comment?.body || "",
-            public: comment?.public === true,
-            created: comment?.created?.jiraRestDateTimeFormat || comment?.created?.iso8601 || "",
-        }));
+        return requireArray(response.values, `comment list for request ${issueKey}`).map(toRequestComment);
     }
 
     /**
@@ -325,11 +333,10 @@ export class JiraServiceDeskClient {
             `comment creation response for request ${issueKey}`,
         );
         return {
-            id: String(created.id ?? ""),
-            author: created.author?.displayName || created.author?.name || "",
-            body: created.body || body,
-            public: created.public === true,
-            created: created.created?.jiraRestDateTimeFormat || created.created?.iso8601 || "",
+            ...toRequestComment(created),
+            // A server that echoes nothing back must still yield the text that
+            // was actually posted, not an empty comment.
+            body: readString(created, "body") || body,
         };
     }
 
@@ -352,20 +359,40 @@ export class JiraServiceDeskClient {
             issueKey,
             approvalId,
             decision,
-            state: answered.finalDecision || "",
+            state: readString(answered, "finalDecision"),
         };
     }
 
-    private toRequestSummary(request: any): ServiceDeskRequestSummary {
-        const issueKey = request?.issueKey || "";
+    private toRequestSummary(request: unknown): ServiceDeskRequestSummary {
+        const issueKey = readString(request, "issueKey");
         return {
             issueKey,
-            requestTypeName: request?.requestType?.name || "",
-            serviceDeskId: String(request?.serviceDeskId ?? request?.serviceDesk?.id ?? ""),
-            status: request?.currentStatus?.status || "",
-            reporter: request?.reporter?.displayName || request?.reporter?.name || "",
-            createdDate: request?.createdDate?.jiraRestDateTimeFormat || request?.createdDate?.iso8601 || "",
+            requestTypeName: readString(request, "requestType", "name"),
+            serviceDeskId: readId(request, "serviceDeskId") || readId(request, "serviceDesk", "id"),
+            status: readString(request, "currentStatus", "status"),
+            reporter: readString(request, "reporter", "displayName") || readString(request, "reporter", "name"),
+            createdDate: readTimestamp(request, "createdDate"),
             url: issueKey ? `${this.options.baseUrl}/browse/${issueKey}` : "",
         };
     }
+}
+
+/**
+ * Service Management wraps every date in an object of alternative renderings
+ * rather than returning a string, and which of them is present varies by
+ * endpoint and version.
+ */
+function readTimestamp(source: unknown, field: string): string {
+    return readString(source, field, "jiraRestDateTimeFormat")
+        || readString(source, field, "iso8601");
+}
+
+function toRequestComment(comment: unknown): ServiceDeskComment {
+    return {
+        id: readId(comment, "id"),
+        author: readString(comment, "author", "displayName") || readString(comment, "author", "name"),
+        body: readString(comment, "body"),
+        public: readBoolean(comment, "public"),
+        created: readTimestamp(comment, "created"),
+    };
 }

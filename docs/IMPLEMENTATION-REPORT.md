@@ -391,24 +391,43 @@ against the *next* version number rather than the current one, so restoring the
 live version would have been accepted: a no-op PUT that burns a page version and
 notifies every watcher. The regression test now pins the correct comparison.
 
-### Test-suite portability
+### Test-suite portability and determinism
 
-`serverPolicy.test.ts` could not boot the server on Windows at all — it passed
-`URL.pathname` to `spawn`, which yields `/C:/…`. That was pre-existing and
-unrelated to this work, but it blocked verifying the new registrations
-end-to-end, so it was fixed with `fileURLToPath`.
+The suite could not honestly gate anything on Windows, and part of it could not
+gate anything anywhere.
+
+`serverPolicy.test.ts` failed to boot the server at all — it passed
+`URL.pathname` to `spawn`, which yields `/C:/…`. Every one of its eleven
+security-policy assertions was therefore reporting `Connection closed` rather
+than checking a policy. Fixed with `fileURLToPath`.
 
 Two attachment-safety assertions interpolated a filesystem path straight into a
 `RegExp`. On Windows the backslashes became regex escapes, so the test failed
-against an error message that was in fact correct — a false negative that would
-have hidden a real regression. Both now escape the path.
+against an error message that was in fact correct — a false negative in the
+worst direction, because it reports a defect where there is none and buries a
+real one in noise. Both now escape the path.
 
-Tests that need real symlinks or POSIX mode bits are gated on a runtime
-capability probe (`SKIP_WITHOUT_SYMLINKS`, `SKIP_WITHOUT_POSIX_MODES`) rather
-than weakened, so they run in full on CI and on any machine that supports them.
-Five tests remain Windows-incompatible by nature (FIFO, unix domain socket and
-character-device refusal, colon-delimited path parsing); Linux/CI is the
-authoritative gate.
+The `httpClient` timeout tests were **non-deterministic**: identical code
+produced 0, 0, 2, 1, 0 failures across five consecutive runs, and `main`
+behaved the same way. The cause was a 20 ms per-attempt timeout that forced a
+race — an *answered* request had to complete a loopback round trip inside the
+same budget that an unanswered one had to exceed. They were rewritten so the
+timeout fires because the stub stays silent rather than because the clock won,
+and so assertions about "no retry happened" wait for the attempt and then give
+a retry room to appear instead of sampling immediately. Eight consecutive runs
+now pass.
+
+The remaining POSIX-only tests (FIFO, unix domain socket, character device,
+symlinks, mode bits) are gated on runtime capability probes in
+`testServer.ts` rather than weakened or deleted. On Linux and CI every one of
+them still runs; where the primitive cannot exist, the test reports why it was
+skipped. The `ATLASSIAN_ATTACHMENT_DIRS` test no longer hard-codes `:` — it
+builds its input from `path.delimiter`, which is the contract the loader
+actually implements and the reason it must not split on a colon: `C:\data`
+contains one.
+
+Result: the full gate now passes with **zero failures** on Windows as well as
+CI, and nothing was skipped that a supported platform can run.
 
 ### Versioning
 
@@ -433,10 +452,10 @@ still announced 1.1.0, so every client logged a version matching no release.
 | Check | Result |
 |---|---|
 | Strict TypeScript check | `tsc -p tsconfig.json --noEmit` passed |
-| Lint | `npm run lint`: 0 errors |
-| Unit tests | 481 tests; 464–465 passed; 5 deterministic failures; 11 skipped |
-| Unit-test failures | POSIX-only cases (FIFO, unix domain socket, character device, colon path delimiter) that cannot run on Windows at all; the two files carrying them went from 14 failures on `main` to 5 on this branch, and the difference is defects fixed here, not checks removed. One timing-sensitive HTTP retry test (`POST is not retried after timing out`) also fails intermittently on this machine, on `main` as well |
-| New tests | 37 added across `jiraExtendedClients.test.ts`, `confluenceExtended.test.ts`, `config.test.ts` and `httpClient.test.ts` |
+| Lint | `npx eslint . --max-warnings 91`: 0 errors, 91 warnings — two *below* the pre-existing CI ceiling, which was lowered to match |
+| Unit tests | 482 tests; 467 passed; **0 failed**; 15 skipped, each with a recorded capability reason |
+| Determinism | The `httpClient` timeout suite was intermittently red — 2 failures across 5 runs, on `main` as well. After the rewrite it passed 8 consecutive runs, then three consecutive full-gate runs |
+| New tests | 37 added across `jiraExtendedClients.test.ts`, `confluenceExtended.test.ts`, `config.test.ts`, `httpClient.test.ts` and `serverPolicy.test.ts` |
 | Default MCP surface | 133 tools; approximately 30,200 tokens |
 | `classic` profile | 86 tools; approximately 20,100 tokens |
 | `ppm` profile | 94 tools; approximately 21,100 tokens |

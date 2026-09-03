@@ -16,7 +16,7 @@ import { atlassianDelete, atlassianGet, atlassianGetBinary, atlassianPost, atlas
 import { decodeProformaDesign, formatProformaAnswer, getProformaChunkCount, getProformaJiraFieldId, } from "./proforma.js";
 import { DEFAULT_CONCURRENCY, mapWithConcurrency } from "./concurrency.js";
 import { fetchPaginatedJiraValues, resolveMaxPaginationPages } from "./jiraPagination.js";
-import { describeUpstreamValue, requireUpstreamArray, requireUpstreamObject } from "./upstreamShape.js";
+import { describeUpstreamValue, readArray, readEntries, readId, readNumber, readString, requireUpstreamArray, requireUpstreamObject } from "./upstreamShape.js";
 
 export interface ClientOptions {
     baseUrl: string;
@@ -1749,18 +1749,23 @@ export class JiraClient {
                 }),
             },
         }), "bulk create response");
-        const created = requireOptionalArray(response.issues, "bulk create issue list").map((issue: any) => ({
-            key: issue?.key || "",
-            id: issue?.id || "",
-            url: issue?.key ? `${this.options.baseUrl}/browse/${issue.key}` : "",
-        }));
-        const errors = requireOptionalArray(response.errors, "bulk create error list").map((error: any) => ({
+        const created = requireOptionalArray(response.issues, "bulk create issue list").map((issue: unknown) => {
+            const key = readString(issue, "key");
+            return {
+                key,
+                id: readId(issue, "id"),
+                url: key ? `${this.options.baseUrl}/browse/${key}` : "",
+            };
+        });
+        const errors = requireOptionalArray(response.errors, "bulk create error list").map((error: unknown) => ({
             // `failedElementNumber` is Jira's index into the request array, which
             // is the only way to tell which of the submitted rows failed.
-            index: typeof error?.failedElementNumber === "number" ? error.failedElementNumber : -1,
+            index: readNumber(error, "failedElementNumber") ?? -1,
             message: [
-                ...(Array.isArray(error?.elementErrors?.errorMessages) ? error.elementErrors.errorMessages : []),
-                ...Object.entries(error?.elementErrors?.errors || {}).map(([field, text]) => `${field}: ${text}`),
+                ...readArray(error, "elementErrors", "errorMessages")
+                    .filter((message: unknown): message is string => typeof message === "string"),
+                ...readEntries(error, "elementErrors", "errors")
+                    .map(([field, text]) => `${field}: ${String(text)}`),
             ].join("; ") || "Jira reported a failure with no message.",
         }));
         return { requested: issues.length, created, failed: errors };
@@ -1777,13 +1782,13 @@ export class JiraClient {
             pat: this.options.pat,
             path: `/rest/api/2/issue/${encodeURIComponent(issueKey)}/remotelink`,
         });
-        return requireOptionalArray(links, `remote link list on issue ${issueKey}`).map((link: any) => ({
-            id: String(link?.id ?? ""),
-            globalId: link?.globalId || "",
-            title: link?.object?.title || "",
-            url: link?.object?.url || "",
-            relationship: link?.relationship || "",
-            applicationName: link?.application?.name || "",
+        return requireOptionalArray(links, `remote link list on issue ${issueKey}`).map((link: unknown) => ({
+            id: readId(link, "id"),
+            globalId: readString(link, "globalId"),
+            title: readString(link, "object", "title"),
+            url: readString(link, "object", "url"),
+            relationship: readString(link, "relationship"),
+            applicationName: readString(link, "application", "name"),
         }));
     }
     /** Attaches an external URL to an issue. Mutates data: POST …/remotelink. */
@@ -1871,7 +1876,7 @@ export class JiraClient {
             votes: typeof response.votes === "number" ? response.votes : 0,
             hasVoted: response.hasVoted === true,
             voters: requireOptionalArray(response.voters, `voter list on issue ${issueKey}`)
-                .map((voter: any) => userLabel(voter)),
+                .map((voter: unknown) => userLabel(voter)),
         };
     }
     async setIssueVote(issueKey: string, vote: boolean): Promise<JiraVoteResult> {
@@ -1928,7 +1933,7 @@ export class JiraClient {
             path: `/rest/api/2/issue/${encodeURIComponent(issueKey)}/properties`,
         }), `property list response for issue ${issueKey}`);
         return requireOptionalArray(response.keys, `property key list on issue ${issueKey}`)
-            .map((entry: any) => entry?.key || "")
+            .map((entry: unknown) => readString(entry, "key"))
             .filter((key: string) => key !== "");
     }
     /**

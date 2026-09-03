@@ -32,8 +32,11 @@ export interface ToolSpec<InputArgs extends z.ZodRawShape> {
      * Cross-field precondition, checked before the handler runs and so before
      * any HTTP request. Returns a message naming what is missing, or undefined
      * when the arguments are usable.
+     *
+     * The argument is `unknown` rather than a typed shape because each tool's
+     * schema differs; every implementation destructures the fields it declared.
      */
-    validate?: (args: any) => string | undefined;
+    validate?: (args: Record<string, unknown>) => string | undefined;
 }
 
 /**

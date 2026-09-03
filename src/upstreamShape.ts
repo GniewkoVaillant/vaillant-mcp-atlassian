@@ -67,3 +67,90 @@ export function requireUpstreamArray(
     }
     return value;
 }
+
+/* ------------------------------------------------------------------ */
+/* Typed readers                                                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Accessors for walking an upstream payload without `any`.
+ *
+ * The older clients in this repository parse Data Center responses through
+ * deliberate `any`, which works but gives up every guarantee at the first
+ * property access: a renamed field reads as `undefined` and a shape change
+ * reads as a `TypeError` somewhere else entirely. These readers keep the
+ * tolerance — an absent field is still just an absent field — while letting the
+ * parsing code be written against `unknown`, so the compiler still checks what
+ * is done with the value once it has been narrowed.
+ *
+ * Each takes a property path so a nested lookup stays one call:
+ * `readString(issue, "fields", "status", "name")`.
+ */
+
+/** Narrows a value to a plain object, or undefined when it is anything else. */
+export function asObject(value: unknown): Record<string, unknown> | undefined {
+    return value !== null && typeof value === "object" && !Array.isArray(value)
+        ? (value as Record<string, unknown>)
+        : undefined;
+}
+
+/** Follows a property path, returning undefined as soon as it leaves an object. */
+export function readPath(source: unknown, ...path: string[]): unknown {
+    let current: unknown = source;
+    for (const key of path) {
+        const object = asObject(current);
+        if (object === undefined) return undefined;
+        current = object[key];
+    }
+    return current;
+}
+
+/** Reads a string, or "" when the field is absent or another type. */
+export function readString(source: unknown, ...path: string[]): string {
+    const value = readPath(source, ...path);
+    return typeof value === "string" ? value : "";
+}
+
+/**
+ * Reads an identifier as a string. Atlassian is inconsistent about whether an
+ * ID arrives as a number or a string — sometimes within one payload — and a
+ * caller that has to handle both is a caller that will get it wrong once.
+ */
+export function readId(source: unknown, ...path: string[]): string {
+    const value = readPath(source, ...path);
+    if (typeof value === "string") return value;
+    if (typeof value === "number" && Number.isFinite(value)) return String(value);
+    return "";
+}
+
+/** Reads a finite number, or null when the field is absent or another type. */
+export function readNumber(source: unknown, ...path: string[]): number | null {
+    const value = readPath(source, ...path);
+    return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+/** Reads a boolean strictly: only a literal `true` counts as true. */
+export function readBoolean(source: unknown, ...path: string[]): boolean {
+    return readPath(source, ...path) === true;
+}
+
+/** Reads an array, or [] when the field is absent or another type. */
+export function readArray(source: unknown, ...path: string[]): unknown[] {
+    const value = readPath(source, ...path);
+    return Array.isArray(value) ? value : [];
+}
+
+/** First non-empty string among several candidate paths on the same source. */
+export function readFirstString(source: unknown, paths: string[][]): string {
+    for (const path of paths) {
+        const value = readString(source, ...path);
+        if (value !== "") return value;
+    }
+    return "";
+}
+
+/** Entries of an object-keyed map, or [] when the value is not an object. */
+export function readEntries(source: unknown, ...path: string[]): [string, unknown][] {
+    const object = asObject(readPath(source, ...path));
+    return object === undefined ? [] : Object.entries(object);
+}

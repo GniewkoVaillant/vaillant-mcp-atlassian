@@ -43,11 +43,16 @@ jobs:
       # only place the tsconfig.build.json path is exercised at all.
       - run: npm ci
 
-      # Descending ceiling. 93 is the current count of no-explicit-any warnings
+      # Descending ceiling. 91 is the current count of no-explicit-any warnings
       # in the Data Center response-parsing layer (0 errors). Lower this number
       # as the debt is paid off; never raise it. Raising it is how a warning
       # budget stops meaning anything.
-      - run: npx eslint . --max-warnings 93
+      #
+      # New parsing code should not add to it at all: `upstreamShape.ts` exposes
+      # typed readers (readString/readId/readNumber/readArray) that walk an
+      # upstream payload from `unknown`, so the newer clients carry none of these
+      # warnings. The remaining count is the older `any`-based layer.
+      - run: npx eslint . --max-warnings 91
 
       # Second compile, deliberately: `prepare` builds via tsconfig.build.json,
       # which excludes src/__tests__, and the unit suite runs against the
@@ -67,9 +72,9 @@ jobs:
       - run: npm run test:smoke
 
       # The destructive surface is a registration branch that the default smoke
-      # run cannot see: it asserts that the six delete tools are absent. Run it
-      # once more with the opt-in so the other half of that assertion - exactly
-      # six delete tools present, and nothing else - is checked too.
+      # run cannot see: it asserts that every destructive tool is absent. Run it
+      # once more with the opt-in so the other half of that assertion - the exact
+      # destructive set present, and nothing else - is checked too.
       - run: npm run test:smoke
         env:
           ATLASSIAN_ALLOW_DESTRUCTIVE: 'true'

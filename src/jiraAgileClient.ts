@@ -6,6 +6,7 @@
  * scopes.
  */
 import { atlassianDelete, atlassianGet, atlassianPost, atlassianPut } from "./httpClient.js";
+import { readBoolean, readNumber, readString } from "./upstreamShape.js";
 import { DEFAULT_CONCURRENCY, mapWithConcurrency } from "./concurrency.js";
 import {
     fetchPaginatedJiraValues,
@@ -494,27 +495,26 @@ export class JiraAgileClient {
             {},
             "board epic",
         );
-        return epics.slice(0, limit).map((epic: any) => ({
-            id: epic?.id,
-            key: epic?.key || "",
-            name: epic?.name || "",
-            summary: epic?.summary || "",
-            done: epic?.done === true,
+        return epics.slice(0, limit).map((epic: unknown) => ({
+            id: readNumber(epic, "id") ?? 0,
+            key: readString(epic, "key"),
+            name: readString(epic, "name"),
+            summary: readString(epic, "summary"),
+            done: readBoolean(epic, "done"),
         }));
     }
 
-    private mapBoardIssues(issues: any[], limit: number): JiraBoardIssueSummary[] {
-        return issues.slice(0, limit).map((issue: any) => {
-            const fields = issue?.fields ?? {};
-            return {
-                key: issue?.key || "",
-                summary: fields.summary || "",
-                status: fields.status?.name || "Unknown",
-                issueType: fields.issuetype?.name || "Unknown",
-                assignee: fields.assignee?.displayName || fields.assignee?.name || "Unassigned",
-                priority: fields.priority?.name || "Unknown",
-            };
-        });
+    private mapBoardIssues(issues: unknown[], limit: number): JiraBoardIssueSummary[] {
+        return issues.slice(0, limit).map((issue: unknown) => ({
+            key: readString(issue, "key"),
+            summary: readString(issue, "fields", "summary"),
+            status: readString(issue, "fields", "status", "name") || "Unknown",
+            issueType: readString(issue, "fields", "issuetype", "name") || "Unknown",
+            assignee: readString(issue, "fields", "assignee", "displayName")
+                || readString(issue, "fields", "assignee", "name")
+                || "Unassigned",
+            priority: readString(issue, "fields", "priority", "name") || "Unknown",
+        }));
     }
 
     /**

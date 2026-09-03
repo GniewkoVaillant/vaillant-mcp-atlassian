@@ -13,7 +13,13 @@ import {
   writeNewAttachment,
   type AttachmentPolicy,
 } from "../attachmentSecurity.js";
-import { SKIP_WITHOUT_POSIX_MODES, SKIP_WITHOUT_SYMLINKS } from "./testServer.js";
+import {
+  SKIP_WITHOUT_CHARACTER_DEVICES,
+  SKIP_WITHOUT_FIFO,
+  SKIP_WITHOUT_POSIX_MODES,
+  SKIP_WITHOUT_SYMLINKS,
+  SKIP_WITHOUT_UNIX_SOCKETS,
+} from "./testServer.js";
 
 /**
  * Interpolating a filesystem path into a RegExp needs escaping: a Windows path
@@ -310,7 +316,7 @@ describe("readExistingAttachment", () => {
   // pre-open lstat, open(O_RDONLY) on a writer-less FIFO blocked in the kernel
   // forever, so every case below is raced against a timeout: a hang must surface as
   // a failing assertion rather than as a suite that never finishes.
-  test("rejects a FIFO promptly instead of blocking forever in open()", async () => {
+  test("rejects a FIFO promptly instead of blocking forever in open()", { skip: SKIP_WITHOUT_FIFO }, async () => {
     const fifo = join(directory, "pipe.fifo");
     makeFifo(fifo);
 
@@ -320,7 +326,7 @@ describe("readExistingAttachment", () => {
     );
   });
 
-  test("keeps unrelated filesystem I/O alive after more FIFO attempts than libuv has threads", async () => {
+  test("keeps unrelated filesystem I/O alive after more FIFO attempts than libuv has threads", { skip: SKIP_WITHOUT_FIFO }, async () => {
     // UV_THREADPOOL_SIZE defaults to 4; six blocked opens used to wedge the whole
     // process, including reads of ordinary files that never touched this module.
     const fifos = Array.from({ length: 6 }, (_unused, index) => join(directory, `pipe-${index}.fifo`));
@@ -342,7 +348,7 @@ describe("readExistingAttachment", () => {
     assert.equal(await withDeadline(readFile(witness, "utf8"), "plain readFile"), "threadpool still healthy");
   });
 
-  test("rejects a unix domain socket promptly", async () => {
+  test("rejects a unix domain socket promptly", { skip: SKIP_WITHOUT_UNIX_SOCKETS }, async () => {
     const socketPath = join(directory, "listener.sock");
     const server = createServer();
     await new Promise<void>((resolveListen, rejectListen) => {
@@ -360,7 +366,7 @@ describe("readExistingAttachment", () => {
     }
   });
 
-  test("rejects a character device promptly", async () => {
+  test("rejects a character device promptly", { skip: SKIP_WITHOUT_CHARACTER_DEVICES }, async () => {
     await assert.rejects(
       withDeadline(readExistingAttachment({ attachmentDirs: ["/dev"] }, "/dev/null"), "character device"),
       /^Error: Attachment filePath must point to a regular file\.$/,

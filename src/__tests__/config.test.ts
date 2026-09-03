@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { chmodSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { delimiter } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ALL_TOOL_GROUPS, loadConfig, type ToolGroup } from "../config.js";
 
@@ -269,12 +270,27 @@ describe("loadConfig scalar parsing", () => {
     assert.throws(() => loadConfig(), /Invalid ATLASSIAN_TIMEOUT_MS "0"/);
   });
 
-  test("ATLASSIAN_ATTACHMENT_DIRS splits on colon and empty values yield an empty array", () => {
+  test("ATLASSIAN_ATTACHMENT_DIRS splits on the platform delimiter and drops empty entries", () => {
     setRequiredEnv();
     assert.deepEqual(loadConfig().attachmentDirs, []);
 
-    process.env.ATLASSIAN_ATTACHMENT_DIRS = " /one :/two:: /three ";
-    assert.deepEqual(loadConfig().attachmentDirs, ["/one", "/two", "/three"]);
+    // Built from path.delimiter rather than a hard-coded ":". The colon is not
+    // a separator on Windows — it is part of every absolute path there
+    // ("C:\\data") — which is exactly why the loader splits on path.delimiter.
+    // Hard-coding ":" made this test assert POSIX behaviour and fail against
+    // correct Windows behaviour, which is a false negative in the worst
+    // direction: it reports a defect where there is none, and would hide a real
+    // one behind noise.
+    const directories = process.platform === "win32"
+      ? ["C:\\one", "C:\\two", "C:\\three"]
+      : ["/one", "/two", "/three"];
+    const [first, second, third] = directories;
+
+    // Surrounding whitespace, a doubled delimiter and a trailing space are all
+    // things an operator really types; each must be tolerated.
+    process.env.ATLASSIAN_ATTACHMENT_DIRS =
+      ` ${first} ${delimiter}${second}${delimiter}${delimiter} ${third} `;
+    assert.deepEqual(loadConfig().attachmentDirs, directories);
   });
 
   test("attachment allowlists reject relative directories and the filesystem root", () => {

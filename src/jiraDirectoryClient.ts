@@ -12,7 +12,13 @@
  * not exist here, and the search parameter is `username`, not `query`.
  */
 import { atlassianGet } from "./httpClient.js";
-import { requireUpstreamArray, requireUpstreamObject } from "./upstreamShape.js";
+import {
+    readBoolean,
+    readPath,
+    readString,
+    requireUpstreamArray,
+    requireUpstreamObject,
+} from "./upstreamShape.js";
 
 export interface JiraDirectoryClientOptions {
     baseUrl: string;
@@ -32,7 +38,7 @@ function clampLimit(limit: number | undefined): number {
     return Math.min(Math.floor(limit), MAX_DIRECTORY_RESULTS);
 }
 
-function requireArray(value: unknown, description: string): any[] {
+function requireArray(value: unknown, description: string): unknown[] {
     return requireUpstreamArray("Jira", value, description);
 }
 
@@ -54,12 +60,15 @@ export interface JiraPermissionSummary {
     havePermission: boolean;
 }
 
-function toUserSummary(user: any): JiraUserSummary {
+function toUserSummary(user: unknown): JiraUserSummary {
     return {
-        name: user?.name || user?.key || "",
-        displayName: user?.displayName || "",
-        emailAddress: user?.emailAddress || "",
-        active: user?.active !== false,
+        // Data Center identifies an account by `name`; `key` is the older
+        // internal identifier and is all that some directory responses carry.
+        name: readString(user, "name") || readString(user, "key"),
+        displayName: readString(user, "displayName"),
+        emailAddress: readString(user, "emailAddress"),
+        // Absent means active: only an explicit `false` deactivates an account.
+        active: readPath(user, "active") !== false,
     };
 }
 
@@ -70,7 +79,7 @@ export class JiraDirectoryClient {
         this.options = options;
     }
 
-    private get<T = any>(path: string, query?: Record<string, string | number | boolean | undefined>): Promise<T> {
+    private get<T = unknown>(path: string, query?: Record<string, string | number | boolean | undefined>): Promise<T> {
         return atlassianGet<T>({ baseUrl: this.options.baseUrl, pat: this.options.pat, path, query });
     }
 
@@ -163,7 +172,7 @@ export class JiraDirectoryClient {
             `group picker response for "${query}"`,
         );
         return requireArray(response.groups, "group picker result list")
-            .map((group: any) => ({ name: group?.name || "" }))
+            .map((group: unknown) => ({ name: readString(group, "name") }))
             .filter((group: JiraGroupSummary) => group.name !== "");
     }
 
@@ -183,10 +192,10 @@ export class JiraDirectoryClient {
         );
         const permissions = requireUpstreamObject("Jira", response.permissions, "permission map");
         return Object.entries(permissions)
-            .map(([key, permission]: [string, any]) => ({
+            .map(([key, permission]: [string, unknown]) => ({
                 key,
-                name: permission?.name || key,
-                havePermission: permission?.havePermission === true,
+                name: readString(permission, "name") || key,
+                havePermission: readBoolean(permission, "havePermission"),
             }))
             // Only granted permissions are actionable, and the full catalogue is
             // ~50 entries of mostly "false" that no caller needs to read.

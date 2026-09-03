@@ -12,7 +12,7 @@ import {
   atlassianPut,
   configureHttp,
 } from "../httpClient.js";
-import { recordRequest, scriptedHandler, sendResponse, withStubServer } from "./testServer.js";
+import { recordRequest, scriptedHandler, sendResponse, withStubServer, type RequestRecord } from "./testServer.js";
 
 const pat = "test-pat";
 
@@ -46,6 +46,43 @@ async function assertAtlassianHttpError(
 function assertElapsedUnder(started: number, limitMs: number): void {
   const elapsed = performance.now() - started;
   assert.ok(elapsed < limitMs, `operation took ${elapsed.toFixed(1)} ms, expected under ${limitMs} ms`);
+}
+
+/**
+ * Per-attempt timeout for the tests that deliberately never get an answer.
+ *
+ * These need two things at once: an unanswered request must time out, and an
+ * answered one must finish comfortably inside the same budget. At the original
+ * 20 ms the second condition was a race against process scheduling — under load
+ * the loopback round trip, or even delivery of the request, lost it, and the
+ * suite failed intermittently with no code change at all. That is worse than a
+ * missing test: an intermittently red suite trains people to ignore it.
+ *
+ * 250 ms leaves the timeout genuinely under test (the stub simply never
+ * responds, so it always fires) while giving a real response an order of
+ * magnitude of headroom.
+ */
+const SLOW_TIMEOUT_MS = 250;
+
+/** Blocks until the stub server has recorded `count` requests, or fails saying it did not. */
+async function waitForRequests(
+  requests: RequestRecord[],
+  count: number,
+  label: string,
+  timeoutMs = 5_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (requests.length < count) {
+    if (Date.now() > deadline) {
+      assert.fail(`${label}: expected ${count} request(s) within ${timeoutMs}ms, saw ${requests.length}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+/** Gives an event that must NOT happen a fair chance to happen before asserting it did not. */
+function settle(milliseconds = 150): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 async function assertError(action: () => Promise<unknown>): Promise<Error> {
@@ -457,7 +494,7 @@ describe("httpClient retry behaviour", () => {
 
 describe("httpClient timeouts", () => {
   test("GET reports a timeout error mentioning the configured timeout and ATLASSIAN_TIMEOUT_MS", async () => {
-    configureHttp({ timeoutMs: 20, maxAttempts: 1 });
+    configureHttp({ timeoutMs: SLOW_TIMEOUT_MS, maxAttempts: 1 });
     await withStubServer(
       async (req, _res, requests) => {
         await recordRequest(req, requests);
@@ -465,17 +502,20 @@ describe("httpClient timeouts", () => {
       async (baseUrl) => {
         const err = await assertError(() => atlassianGet({ baseUrl, pat, path: "/rest/api/2/slow" }));
 
-        assert.match(err.message, /timed out after 20ms/);
+        assert.match(err.message, new RegExp(`timed out after ${SLOW_TIMEOUT_MS}ms`));
         assert.match(err.message, /ATLASSIAN_TIMEOUT_MS/);
       },
     );
   });
 
   test("GET retries after timing out because it is idempotent", async () => {
-    configureHttp({ timeoutMs: 20, maxAttempts: 2 });
+    configureHttp({ timeoutMs: SLOW_TIMEOUT_MS, maxAttempts: 2 });
     await withStubServer(
       async (req, res, requests) => {
         await recordRequest(req, requests);
+        // The first attempt is never answered, so the timeout fires because the
+        // server stayed silent — not because the clock beat a loopback round
+        // trip. The second is answered immediately.
         if (requests.length === 2) {
           sendResponse(res, { body: '{"ok":true}' });
         }
@@ -490,7 +530,7 @@ describe("httpClient timeouts", () => {
   });
 
   test("POST is not retried after timing out because a timed-out write may already have been applied", async () => {
-    configureHttp({ timeoutMs: 20, maxAttempts: 3 });
+    configureHttp({ timeoutMs: SLOW_TIMEOUT_MS, maxAttempts: 3 });
     await withStubServer(
       async (req, _res, requests) => {
         await recordRequest(req, requests);
@@ -500,7 +540,15 @@ describe("httpClient timeouts", () => {
           atlassianPost({ baseUrl, pat, path: "/rest/api/2/issue", body: { fields: {} } }),
         );
 
-        assert.match(err.message, /timed out after 20ms/);
+        assert.match(err.message, new RegExp(`timed out after ${SLOW_TIMEOUT_MS}ms`));
+        // Wait for the attempt to be recorded rather than assuming it already
+        // is: the client gives up on its own timer, which says nothing about
+        // when the server finished reading the request.
+        await waitForRequests(requests, 1, "POST timeout");
+        // Then give a retry that must not happen room to show up. Asserting
+        // immediately would pass even if the client were about to replay the
+        // write, which is the failure this test exists to catch.
+        await settle();
         assert.equal(requests.length, 1);
       },
     );
@@ -525,6 +573,11 @@ describe("httpClient end-to-end deadlines and admission control", () => {
         // Upper bound only has to stay well under the retry sleep it is proving we
         // skipped; a GC pause on a loaded CI box must not read as a failure.
         assertElapsedUnder(started, 900);
+        // The client gave up on its own deadline, which says nothing about when
+        // the server finished reading the request. Wait for the attempt, then
+        // give a retry that must not happen room to appear.
+        await waitForRequests(requests, 1, "retried operation deadline");
+        await settle();
         assert.equal(requests.length, 1);
       },
     );
@@ -543,6 +596,8 @@ describe("httpClient end-to-end deadlines and admission control", () => {
         );
 
         assertElapsedUnder(started, 1_200);
+        await waitForRequests(requests, 1, "Retry-After budget");
+        await settle();
         assert.equal(requests.length, 1);
       },
     );

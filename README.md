@@ -225,8 +225,10 @@ src/
   concurrency.ts       bounded parallelism for batch tools
   attachmentSecurity.ts  the only place that touches the local filesystem: path
                          canonicalization, symlink/hard-link/FIFO refusal, atomic create
-  upstreamShape.ts     shape guards for Data Center responses: a malformed payload
-                       raises a domain error naming the resource, never a TypeError
+  upstreamShape.ts     shape guards and typed readers for Data Center responses: a
+                       malformed payload raises a domain error naming the resource,
+                       never a TypeError, and the readers let new parsing code walk
+                       an untyped payload from `unknown` instead of `any`
   jiraPagination.ts    the shared Jira paging walk: page budget, stalled-cursor and
                        repeated-page detection; raises rather than returning partial data
   index.ts             server bootstrap, the policy gate that decides what is registered,

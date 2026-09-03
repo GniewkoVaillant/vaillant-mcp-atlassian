@@ -10,7 +10,8 @@
  * incentive to write only happy-path stubs.
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -22,16 +23,22 @@ import { join } from "node:path";
 /* ------------------------------------------------------------------ */
 
 /**
- * Some of the attachment-safety tests need real filesystem primitives that
- * Windows does not always provide: creating a symlink requires Developer Mode
- * or elevation, and NTFS has no POSIX mode bits at all.
+ * Some of the attachment-safety tests need filesystem primitives that only
+ * exist on POSIX: FIFOs, unix domain sockets bound to a path, character
+ * devices, and the mode bits and symlinks the rest of the suite relies on.
  *
- * These are probed at runtime rather than switched on `process.platform`, so a
- * Windows machine that *can* do it still runs the check. The checks themselves
- * are never weakened — on CI, where both primitives exist, every one of them
- * runs. Skipping is strictly better than the alternatives here: asserting POSIX
- * modes on NTFS tests the platform rather than the code, and a suite that
- * cannot start locally is a suite nobody runs before pushing.
+ * These are probed at runtime wherever the capability is genuinely optional —
+ * a Windows machine with Developer Mode enabled *can* create symlinks, and a
+ * minimal container may lack `mkfifo` — so the check runs wherever it can
+ * rather than being switched off by platform name. The checks themselves are
+ * never weakened: on CI, where every primitive exists, every one of them runs.
+ *
+ * Skipping is strictly better than the two alternatives. Letting them fail
+ * teaches developers to ignore a red suite, which is how a real regression gets
+ * through; asserting POSIX semantics on NTFS tests the platform rather than the
+ * code. What the guarded behaviour protects is unaffected either way: the
+ * production code still refuses non-regular files on Windows, there is simply
+ * no way to construct one there.
  */
 function probeSymlinkSupport(): string | false {
   const directory = mkdtempSync(join(tmpdir(), "mcp-atlassian-symlink-probe-"));
@@ -46,6 +53,28 @@ function probeSymlinkSupport(): string | false {
   }
 }
 
+function probeFifoSupport(): string | false {
+  const directory = mkdtempSync(join(tmpdir(), "mcp-atlassian-fifo-probe-"));
+  try {
+    execFileSync("mkfifo", [join(directory, "probe.fifo")], { stdio: "ignore" });
+    return false;
+  } catch {
+    return "mkfifo is unavailable; FIFOs are a POSIX filesystem object with no Windows equivalent";
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+function probeCharacterDevice(): string | false {
+  try {
+    return statSync("/dev/null").isCharacterDevice()
+      ? false
+      : "/dev/null exists but is not a character device";
+  } catch {
+    return "/dev/null is unavailable; character devices are POSIX-only";
+  }
+}
+
 /** `skip` value for a test that needs to create a real symlink. */
 export const SKIP_WITHOUT_SYMLINKS: string | false = probeSymlinkSupport();
 
@@ -53,6 +82,25 @@ export const SKIP_WITHOUT_SYMLINKS: string | false = probeSymlinkSupport();
 export const SKIP_WITHOUT_POSIX_MODES: string | false =
   process.platform === "win32"
     ? "NTFS has no POSIX mode bits; stat() reports 0o666 for any writable file"
+    : false;
+
+/** `skip` value for a test that needs a FIFO. */
+export const SKIP_WITHOUT_FIFO: string | false = probeFifoSupport();
+
+/** `skip` value for a test that needs a character device such as `/dev/null`. */
+export const SKIP_WITHOUT_CHARACTER_DEVICES: string | false = probeCharacterDevice();
+
+/**
+ * `skip` value for a test that binds a unix domain socket to a filesystem path.
+ *
+ * Stated by platform rather than probed, because this one is not conditionally
+ * available: Node on Windows maps `net.Server.listen(path)` onto named pipes and
+ * accepts only `\\.\pipe\…` names, so binding a path inside a temp directory can
+ * never work there, under any configuration.
+ */
+export const SKIP_WITHOUT_UNIX_SOCKETS: string | false =
+  process.platform === "win32"
+    ? "Windows has no filesystem-bound unix domain sockets; only \\\\.\\pipe\\ names are accepted"
     : false;
 
 export type RequestRecord = {
