@@ -391,7 +391,58 @@ against the *next* version number rather than the current one, so restoring the
 live version would have been accepted: a no-op PUT that burns a page version and
 notifies every watcher. The regression test now pins the correct comparison.
 
+### Live verification against a real Data Center instance
+
+Authorised by the user for **read-only** calls only. Three safeguards, in order
+of strength: `ATLASSIAN_READ_ONLY=true` was forced so no mutating tool was
+*registered* at all; the probe asserted that every one of the 85 exposed tools
+carried `readOnlyHint: true` and aborted otherwise; and only tools on an
+explicit allowlist were called. No issue content, page content, name, key or
+hostname was printed — the probe reports a verdict and a shape, and redacts
+every identifier it discovers.
+
+**51 of 51 endpoints answered correctly** on the live instance, covering every
+new area: metadata and `createmeta`, the dictionaries, project configuration,
+the user and group directory, permissions, filters and dashboards, issue-level
+reads, the agile reads, Jira Service Management, and the whole Confluence
+surface including export, restrictions, labels, properties and trash.
+
+This is what documentation review could not establish, and it found two real
+defects that no synthetic test would have.
+
+#### Defect 1: board discovery could not discover a board
+
+`jira_list_boards` walked the collection to its end. The instance has **2346
+boards**, which exhausted the page budget and returned a hard error — so the one
+tool whose entire job is to find a board ID could not find one, and every
+board-scoped tool was unreachable through it. Filtering by name did not help
+(914 boards still exceeded the budget), and filtering by project returned none.
+
+This was pre-existing, not introduced here, and invisible to every test:
+the fixtures were small, so the walk always terminated.
+
+#### Defect 2: a small limit made the walk *longer*
+
+`jira_get_board_issues` — added in this change — used the caller's `limit` as
+the *page size* and then walked to the end of the collection. Asking for 5
+issues on a 292-issue board therefore paged 5 at a time until the page budget
+ran out and failed. A smaller request cost more, which is exactly backwards.
+
+#### The fix
+
+`fetchPaginatedJiraValues` gained an optional `maxItems` that stops the walk on
+the result count, and now returns `{ values, hasMore, total }` instead of a bare
+array. Page size is decided independently of the caller's window. `listBoards`,
+`getBoardBacklog`, `getBoardIssues` and `listBoardEpics` return a window with
+`returned`, `total` and `hasMore`, so a truncated answer is never mistaken for a
+complete one — the same convention the Confluence list tools already used.
+
+Both defects were then re-verified live: board discovery now answers "5 of 2346,
+hasMore=true" and all four agile reads succeed.
+
 ### Testing the tool surface, not just the clients
+
+
 
 The unit tests exercise the clients directly, which left the layer the model
 actually touches untested: MCP registration, the Zod schemas, the cross-field
@@ -486,8 +537,9 @@ still announced 1.1.0, so every client logged a version matching no release.
 |---|---|
 | Strict TypeScript check | `tsc -p tsconfig.json --noEmit` passed |
 | Lint | `npx eslint . --max-warnings 91`: 0 errors, 91 warnings — two *below* the pre-existing CI ceiling, which was lowered to match |
-| Unit tests | 510 tests; 495 passed; **0 failed**; 15 skipped, each with a recorded capability reason |
-| End-to-end tool surface | 28 checks driving the built server over stdio through MCP against a stub Data Center; all pass |
+| Unit tests | 513 tests; 498 passed; **0 failed**; 15 skipped, each with a recorded capability reason |
+| End-to-end tool surface | 29 checks driving the built server over stdio through MCP against a stub Data Center; all pass |
+| **Live read-only verification** | **51 of 51 endpoints answered correctly against the real instance**, under forced read-only mode with an annotation-verified tool set; found and fixed two pagination defects |
 | Mutation check | 3 deliberate defects injected one at a time, each caught by the intended assertion; all files restored byte-identical |
 | Determinism | The `httpClient` timeout suite was intermittently red — 2 failures across 5 runs, on `main` as well. After the rewrite it passed 8 consecutive runs, then three consecutive full-gate runs |
 | New tests | 65 added across `jiraExtendedClients.test.ts`, `confluenceExtended.test.ts`, `toolSurface.test.ts`, `config.test.ts`, `httpClient.test.ts` and `serverPolicy.test.ts` |
@@ -500,18 +552,21 @@ still announced 1.1.0, so every client logged a version matching no release.
 | `core` profile | 24 tools; approximately 4,900 tokens |
 | Explicit destructive opt-in | 150 tools; 17 destructive tools; approximately 33,500 tokens |
 | Read-only plus destructive opt-in | 85 tools; 0 destructive tools — read-only still wins |
-| Live Jira/Confluence traffic | **Not performed.** No endpoint added here has been exercised against a real Data Center instance |
+| Live Jira/Confluence traffic | **Performed, read-only, with explicit authorisation.** 51 read-only endpoints verified against the real instance; no write, delete or modify call was made, and none was even registered |
 | Deployment | Not performed |
 
 ### Residual risk
 
-Every new endpoint is verified against documentation and synthetic servers, not
-against a live instance. Data Center versions differ, apps alter behaviour, and
-permissions vary per project and space. Before relying on the write tools in
-anger, run `ATLASSIAN_SMOKE_LIVE=true npm run test:smoke` against the target
-instance and exercise the specific tools you intend to use on a scratch project
-and a scratch space — particularly `jira_bulk_create_issues`, the sprint writes
-and anything touching Confluence spaces.
+The **read** surface is now verified against the real instance: 51 endpoints
+answered correctly. The **write** surface is not, and cannot be without
+authorisation to create real data — every write tool was verified against
+documentation, synthetic servers and the MCP protocol, but never against your
+Jira and Confluence.
+
+Before relying on the write tools in anger, exercise the specific ones you
+intend to use on a scratch project and a scratch space — particularly
+`jira_bulk_create_issues`, the sprint writes, and anything touching Confluence
+spaces, which is the one operation with no recoverable trash.
 
 Context cost is the other live risk. At 133 tools the default profile spends
 roughly 30k tokens on tool definitions before any question is asked. Choose a

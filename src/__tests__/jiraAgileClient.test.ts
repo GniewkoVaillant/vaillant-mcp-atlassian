@@ -53,10 +53,12 @@ describe("JiraAgileClient bounded pagination", () => {
     }), async (baseUrl, requests) => {
       const client = new JiraAgileClient({ baseUrl, pat: "test-pat", maxPaginationPages: 2 });
 
-      const boards = await client.listBoards({ name: "Board", projectKeyOrId: "SAFE" });
+      const result = await client.listBoards({ name: "Board", projectKeyOrId: "SAFE" });
 
-      assert.deepEqual(boards.map((board) => board.id), [1, 2]);
-      assert.equal(boards[0]?.projectKey, "SAFE");
+      assert.deepEqual(result.boards.map((board) => board.id), [1, 2]);
+      assert.equal(result.boards[0]?.projectKey, "SAFE");
+      assert.equal(result.hasMore, false, "the collection ended, so nothing was withheld");
+      assert.equal(result.total, 2);
       assert.deepEqual(requests.map((request) => request.searchParams.get("startAt")), ["0", "1"]);
       assert.equal(requests[0]?.searchParams.get("maxResults"), "50");
       assert.equal(requests[0]?.searchParams.get("name"), "Board");
@@ -104,10 +106,54 @@ describe("JiraAgileClient bounded pagination", () => {
     }), async (baseUrl, requests) => {
       const client = new JiraAgileClient({ baseUrl, pat: "test-pat", maxPaginationPages: 3 });
 
-      const boards = await client.listBoards();
+      const result = await client.listBoards();
 
-      assert.deepEqual(boards.map((board) => board.id), [1, 2]);
+      assert.deepEqual(result.boards.map((board) => board.id), [1, 2]);
       assert.equal(requests.length, 3);
+    });
+  });
+
+  test("stops at the requested limit and says the collection continues", async () => {
+    // The instance that motivated this answered with 2346 boards: walking to
+    // the end exhausted the page budget and turned board discovery into a hard
+    // error, so the one tool whose job is to find a board ID could not.
+    await withAgileServer((url) => {
+      const startAt = Number(url.searchParams.get("startAt"));
+      return {
+        startAt,
+        total: 2346,
+        isLast: false,
+        values: Array.from({ length: 50 }, (_unused, index) => ({
+          id: startAt + index + 1,
+          name: `Board ${startAt + index + 1}`,
+        })),
+      };
+    }, async (baseUrl, requests) => {
+      const client = new JiraAgileClient({ baseUrl, pat: "test-pat", maxPaginationPages: 10 });
+
+      const result = await client.listBoards({ limit: 20 });
+
+      assert.equal(result.returned, 20);
+      assert.equal(result.hasMore, true, "truncation must be reported, never silent");
+      assert.equal(result.total, 2346);
+      // One page covered the request; the remaining 2326 boards are not fetched.
+      assert.equal(requests.length, 1);
+    });
+  });
+
+  test("a limit larger than the collection still reports it as complete", async () => {
+    await withAgileServer((url) => ({
+      startAt: Number(url.searchParams.get("startAt")),
+      total: 2,
+      isLast: true,
+      values: [{ id: 1, name: "Only board" }, { id: 2, name: "Second board" }],
+    }), async (baseUrl) => {
+      const client = new JiraAgileClient({ baseUrl, pat: "test-pat", maxPaginationPages: 3 });
+
+      const result = await client.listBoards({ limit: 100 });
+
+      assert.equal(result.returned, 2);
+      assert.equal(result.hasMore, false);
     });
   });
 

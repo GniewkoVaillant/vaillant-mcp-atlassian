@@ -36,20 +36,44 @@ export interface JiraPaginationOptions {
     query?: PaginationQuery;
     /** Names the collection in every error message, e.g. `issue ABC-1 changelog`. */
     resourceName: string;
+    /**
+     * Stop once this many rows have been collected, and say so, instead of
+     * walking to the end of the collection.
+     *
+     * Without it, a discovery call on a large instance is a walk over every row
+     * that exists: a real deployment answered `jira_list_boards` with 2346
+     * boards, which blew the page budget and turned a lookup into a hard error.
+     * Stopping early is only safe because `hasMore` distinguishes "this is the
+     * whole collection" from "this is the first N of it".
+     */
+    maxItems?: number;
+}
+
+export interface JiraPaginationResult {
+    values: any[];
+    /** True when rows remain: either the walk hit `maxItems` or the server said so. */
+    hasMore: boolean;
+    /** The server's own count, when it reported one. */
+    total: number | null;
 }
 
 /**
- * Walks an offset-paginated Jira collection to its end, or fails saying why it
- * could not. Caps upstream calls, rejects stalled, empty-too-early and
- * repeated pages, and never passes an incomplete collection off as a complete
- * one: a truncated board list or changelog is indistinguishable from a real
- * one once it is returned, so partial data is an error, not a result.
+ * Walks an offset-paginated Jira collection to its end — or to `maxItems` — or
+ * fails saying why it could not. Caps upstream calls, rejects stalled,
+ * empty-too-early and repeated pages, and never passes an incomplete collection
+ * off as a complete one: a truncated board list or changelog is
+ * indistinguishable from a real one once it is returned, so partial data is
+ * either flagged through `hasMore` or reported as an error, never returned
+ * silently.
  */
-export async function fetchPaginatedJiraValues(options: JiraPaginationOptions): Promise<any[]> {
-    const { itemProperty, maxPaginationPages, resourceName } = options;
-        const results: any[] = [];
+export async function fetchPaginatedJiraValues(
+    options: JiraPaginationOptions,
+): Promise<JiraPaginationResult> {
+    const { itemProperty, maxPaginationPages, resourceName, maxItems } = options;
+    const results: any[] = [];
     const seenPageSignatures = new Set<string>();
     let startAt = 0;
+    let reportedTotal: number | null = null;
 
     for (let pageNumber = 1; pageNumber <= maxPaginationPages; pageNumber += 1) {
         const page = await atlassianGet({
@@ -92,6 +116,7 @@ export async function fetchPaginatedJiraValues(options: JiraPaginationOptions): 
                 `Jira ${resourceName} pagination returned an invalid total.`,
             );
         }
+        if (typeof total === "number") reportedTotal = total;
 
         if (values.length === 0) {
             if (page.isLast === false || (total !== undefined && startAt < total)) {
@@ -100,7 +125,7 @@ export async function fetchPaginatedJiraValues(options: JiraPaginationOptions): 
                     `returned at startAt=${startAt} before all results were retrieved.`,
                 );
             }
-            return results;
+            return { values: results, hasMore: false, total: reportedTotal };
         }
 
         const identifiers = values.map((value) => value?.id ?? value?.key);
@@ -124,7 +149,13 @@ export async function fetchPaginatedJiraValues(options: JiraPaginationOptions): 
             page.isLast === true ||
             (total !== undefined && startAt >= total)
         ) {
-            return results;
+            return { values: results, hasMore: false, total: reportedTotal };
+        }
+
+        // Deliberate early stop: the caller asked for a window, not the whole
+        // collection, and `hasMore` tells it which one it got.
+        if (maxItems !== undefined && results.length >= maxItems) {
+            return { values: results.slice(0, maxItems), hasMore: true, total: reportedTotal };
         }
 
         if (pageNumber === maxPaginationPages) {

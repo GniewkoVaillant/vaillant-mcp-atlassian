@@ -1272,9 +1272,12 @@ async function main() {
     });
     tool("agile", "read", "jira_list_boards", {
         title: "List Jira Agile boards",
-        description: "List Jira Agile boards (Data Center) visible to the current user, with id, name, type " +
+        description:
+            "List Jira Agile boards (Data Center) visible to the current user, with id, name, type " +
             "and owning project. Every board-scoped tool here needs a board ID, so start with this. " +
-            "Read-only.",
+            "A large instance carries thousands of boards, so this returns a bounded window: check " +
+            "`hasMore` and `total`, and narrow with `name` or `projectKeyOrId` rather than raising " +
+            "`limit`. Read-only.",
         inputSchema: {
             name: z
                 .string()
@@ -1284,17 +1287,24 @@ async function main() {
                 .string()
                 .optional()
                 .describe("Optional project key or id to restrict boards to, e.g. 'ABC'"),
+            limit: z
+                .number()
+                .int()
+                .positive()
+                .max(200)
+                .optional()
+                .describe("Maximum boards to return (default 50, hard cap 200)"),
         },
-    }, async ({ name, projectKeyOrId }) => {
+    }, async ({ name, projectKeyOrId, limit }) => {
         try {
-            const boards = await jiraAgileClient.listBoards({ name, projectKeyOrId });
+            const result = await jiraAgileClient.listBoards({ name, projectKeyOrId, limit });
             return {
                 content: [
                     {
                         type: "text",
-                        text: boards.length === 0
+                        text: result.returned === 0
                             ? "No boards found."
-                            : JSON.stringify(boards),
+                            : JSON.stringify(result),
                     },
                 ],
             };

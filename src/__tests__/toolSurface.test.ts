@@ -319,9 +319,22 @@ describe("tool surface: Jira agile writes", () => {
     test("jira_get_board_backlog returns triage-ready issue summaries", async () => {
         const backlog = await callTool("jira_get_board_backlog", { boardId: 42 });
 
-        assert.deepEqual(backlog.map((issue: any) => issue.key), ["ABC-9"]);
-        assert.equal(backlog[0].assignee, "Anna Kowalska");
-        assert.equal(backlog[0].status, "To Do");
+        assert.deepEqual(backlog.issues.map((issue: any) => issue.key), ["ABC-9"]);
+        assert.equal(backlog.issues[0].assignee, "Anna Kowalska");
+        assert.equal(backlog.issues[0].status, "To Do");
+        assert.equal(backlog.hasMore, false);
+    });
+
+    test("a small limit stops the walk instead of shrinking every page", async () => {
+        // The defect this pins: a board with 292 issues answered a request for
+        // 5 by paging 5 at a time until the page budget ran out, then failed —
+        // the opposite of what a small window should cost.
+        const issues = await callTool("jira_get_board_issues", { boardId: 42, limit: 5 });
+
+        assert.equal(issues.returned <= 5, true);
+        const sent = received.filter((request) => request.path === "/rest/agile/1.0/board/42/issue");
+        assert.equal(sent.length, 1, "one page must be enough for a five-issue window");
+        assert.equal(sent[0].query.get("maxResults"), "100", "page size is independent of the window");
     });
 
     test("jira_update_sprint sends a partial update, not a wholesale replacement", async () => {
@@ -615,6 +628,26 @@ function registerRoutes(): void {
                     priority: { name: "High" },
                 },
             }],
+        },
+    }));
+
+    route("GET", /^\/rest\/agile\/1\.0\/board\/42\/issue$/, (request) => ({
+        body: {
+            startAt: Number(request.query.get("startAt") ?? 0),
+            // A board far larger than the window asked for: the walk must stop
+            // on the result count, not keep paging until the budget runs out.
+            total: 292,
+            isLast: false,
+            issues: Array.from({ length: 100 }, (_unused, index) => ({
+                id: String(index + 1),
+                key: `ABC-${index + 1}`,
+                fields: {
+                    summary: "Something to do",
+                    status: { name: "To Do" },
+                    issuetype: { name: "Task" },
+                    priority: { name: "Medium" },
+                },
+            })),
         },
     }));
 

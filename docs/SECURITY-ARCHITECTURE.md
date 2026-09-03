@@ -141,6 +141,13 @@ service-desk reads, 50 issues per Agile move or rank request, 50 rows per
 `jira_get_create_meta`. Batch limits are enforced client-side with a message
 naming the limit, rather than relayed as an upstream 400.
 
+Board discovery and the board issue collections take a bounded window with
+`hasMore` and `total` rather than enumerating the instance. This is an
+availability control as much as a usability one: a production instance answered
+`jira_list_boards` with 2346 boards, and walking all of them both exhausted the
+page budget and put fifty needless requests through the shared concurrency
+budget for a lookup that needed one.
+
 ProForma chunk fetching is bounded at both levels, not only the inner one. A
 single form decodes at most `MAX_PROFORMA_CHUNKS` (25) chunks, fetched
 `DEFAULT_CONCURRENCY` (5) at a time; the summary tool that walks several forms

@@ -251,12 +251,20 @@ src/
 pools, and every Jira/Confluence HTTP request also shares the process-wide
 upstream concurrency and queue limits. ProForma chunk fan-out is bounded too.
 
-**Automatic pagination fails closed.** Boards, sprints and sprint issues on the
-Jira Agile side, issue changelogs on the Jira side, and spaces, child pages and
-comments on the Confluence side, all
-stop after `ATLASSIAN_MAX_PAGINATION_PAGES`; repeated or non-advancing pages are
-rejected rather than returned as misleading, apparently complete results. Hitting
-the page budget raises an error — partial results are never presented as whole.
+**Automatic pagination fails closed, and windows say so.** Boards, sprints and
+sprint issues on the Jira Agile side, issue changelogs on the Jira side, and
+spaces, child pages and comments on the Confluence side all stop after
+`ATLASSIAN_MAX_PAGINATION_PAGES`; repeated or non-advancing pages are rejected
+rather than returned as misleading, apparently complete results. Hitting the
+page budget raises an error — partial results are never presented as whole.
+
+Discovery tools that could enumerate an entire large instance return a bounded
+window instead: `jira_list_boards`, `jira_get_board_backlog`,
+`jira_get_board_issues` and `jira_list_board_epics` report `returned`, `total`
+and `hasMore`. This matters more than it sounds — a real instance carries 2346
+boards, and walking them all turned board discovery into a hard error. Narrow
+with `name` or `projectKeyOrId` rather than raising `limit`; the page size is
+chosen independently, so a small `limit` costs one request, not many.
 
 **An update with no fields is refused.** `jira_update_issue`,
 `confluence_update_page` and every other partial-update tool added since reject a

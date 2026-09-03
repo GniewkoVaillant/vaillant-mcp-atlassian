@@ -20,11 +20,12 @@ export function registerJiraAgileWriteTools(tool: ToolRegistrar, client: JiraAgi
         title: "Get a Jira board's backlog",
         description: "List the issues on a board that are in no sprint — the board's backlog. Sprint " +
             "planning starts here; without it the candidate work can only be found by reconstructing " +
-            "the board's filter as JQL. Read-only.",
+            "the board's filter as JQL. Returns a bounded window: check `hasMore` and `total`. " +
+            "Read-only.",
         inputSchema: {
             boardId: boardIdSchema.describe("Board ID from jira_list_boards"),
             limit: z.number().int().positive().max(200).optional()
-                .describe("Maximum issues to return (default 50)"),
+                .describe("Maximum issues to return (default 50, hard cap 200)"),
         },
     }, async ({ boardId, limit }) =>
         runTool("jira_get_board_backlog", () => client.getBoardBacklog(boardId, limit)));
@@ -33,12 +34,13 @@ export function registerJiraAgileWriteTools(tool: ToolRegistrar, client: JiraAgi
         title: "Get issues on a Jira board",
         description: "List the issues a board covers, optionally narrowed by JQL. Unlike a plain " +
             "jira_search_issues call, this applies the board's own filter first, so the answer matches " +
-            "what the board actually shows. Read-only.",
+            "what the board actually shows. Returns a bounded window: check `hasMore` and `total`. " +
+            "Read-only.",
         inputSchema: {
             boardId: boardIdSchema.describe("Board ID from jira_list_boards"),
             jql: z.string().max(10_000).optional().describe("Optional extra JQL, applied on top of the board's filter"),
             limit: z.number().int().positive().max(200).optional()
-                .describe("Maximum issues to return (default 50)"),
+                .describe("Maximum issues to return (default 50, hard cap 200)"),
         },
     }, async ({ boardId, jql, limit }) =>
         runTool("jira_get_board_issues", () => client.getBoardIssues(boardId, { jql, limit })));
@@ -46,11 +48,11 @@ export function registerJiraAgileWriteTools(tool: ToolRegistrar, client: JiraAgi
     tool("agile", "read", "jira_list_board_epics", {
         title: "List epics on a Jira board",
         description: "List the epics configured on a board, with their keys, names and whether they are " +
-            "marked done. Read-only.",
+            "marked done. Returns a bounded window: check `hasMore` and `total`. Read-only.",
         inputSchema: {
             boardId: boardIdSchema.describe("Board ID from jira_list_boards"),
             limit: z.number().int().positive().max(200).optional()
-                .describe("Maximum epics to return (default 50)"),
+                .describe("Maximum epics to return (default 50, hard cap 200)"),
         },
     }, async ({ boardId, limit }) =>
         runTool("jira_list_board_epics", () => client.listBoardEpics(boardId, limit)));

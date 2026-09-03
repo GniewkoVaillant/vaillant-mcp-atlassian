@@ -1542,7 +1542,7 @@ export class JiraClient {
      * than an error, because nothing downstream can tell it is incomplete.
      */
     async getIssueChangelogViaDedicatedEndpoint(issueKey: string): Promise<JiraIssueChangelog> {
-        const histories = await fetchPaginatedJiraValues({
+        const { values: histories } = await fetchPaginatedJiraValues({
             baseUrl: this.options.baseUrl,
             pat: this.options.pat,
             maxPaginationPages: this.maxPaginationPages,

@@ -30,6 +30,15 @@ export interface JiraBoardSummary {
     projectName: string;
 }
 
+/** A window onto the board list, with enough metadata to detect truncation. */
+export interface JiraBoardListResult {
+    returned: number;
+    /** The server's own count, when it reported one. */
+    total: number | null;
+    hasMore: boolean;
+    boards: JiraBoardSummary[];
+}
+
 export interface JiraSprintSummary {
     id: number;
     name: string;
@@ -59,6 +68,22 @@ export interface JiraEpicSummary {
     name: string;
     summary: string;
     done: boolean;
+}
+
+/** A window onto a board's issue collection, with truncation reported. */
+export interface JiraBoardIssueListResult {
+    returned: number;
+    total: number | null;
+    hasMore: boolean;
+    issues: JiraBoardIssueSummary[];
+}
+
+/** A window onto a board's epics, with truncation reported. */
+export interface JiraEpicListResult {
+    returned: number;
+    total: number | null;
+    hasMore: boolean;
+    epics: JiraEpicSummary[];
 }
 
 /** Outcome of a backlog/sprint move or a rank change. */
@@ -167,8 +192,9 @@ export class JiraAgileClient {
         maxResults: number,
         query: PaginationQuery,
         resourceName: string,
+        maxItems?: number,
     ): Promise<any[]> {
-        return await fetchPaginatedJiraValues({
+        const { values } = await fetchPaginatedJiraValues({
             baseUrl: this.options.baseUrl,
             pat: this.options.pat,
             maxPaginationPages: this.maxPaginationPages,
@@ -177,28 +203,49 @@ export class JiraAgileClient {
             maxResults,
             query,
             resourceName,
+            maxItems,
         });
+        return values;
     }
     /**
      * Lists boards visible to the PAT's owner, optionally filtered by name or
      * project. Three tools here take a board ID, and before this there was no
      * way to discover one from inside the agent.
+     *
+     * Bounded by `limit` rather than enumerating every board: a real Data
+     * Center deployment answered this with 2346 boards, which exhausted the
+     * page budget and turned board discovery into a hard error — so the one
+     * tool whose whole job is to find a board ID could not find one, and every
+     * board-scoped tool was unreachable with it. `hasMore` and `total` report
+     * when the answer is a window rather than the whole list.
      */
-    async listBoards(options: { name?: string; projectKeyOrId?: string } = {}): Promise<JiraBoardSummary[]> {
-        const boards = await this.getPaginatedValues(
-            "/rest/agile/1.0/board",
-            "values",
-            50,
-            { name: options.name, projectKeyOrId: options.projectKeyOrId },
-            "board",
-        );
-        return boards.map((board) => ({
-            id: board.id,
-            name: board.name || "",
-            type: board.type || "",
-            projectKey: board.location?.projectKey || "",
-            projectName: board.location?.projectName || "",
-        }));
+    async listBoards(
+        options: { name?: string; projectKeyOrId?: string; limit?: number } = {},
+    ): Promise<JiraBoardListResult> {
+        const limit = Math.min(Math.max(options.limit ?? 50, 1), 200);
+        const { values, hasMore, total } = await fetchPaginatedJiraValues({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            maxPaginationPages: this.maxPaginationPages,
+            path: "/rest/agile/1.0/board",
+            itemProperty: "values",
+            maxResults: 50,
+            query: { name: options.name, projectKeyOrId: options.projectKeyOrId },
+            resourceName: "board",
+            maxItems: limit,
+        });
+        return {
+            returned: values.length,
+            total,
+            hasMore,
+            boards: values.map((board) => ({
+                id: board.id,
+                name: board.name || "",
+                type: board.type || "",
+                projectKey: board.location?.projectKey || "",
+                projectName: board.location?.projectName || "",
+            })),
+        };
     }
     /**
      * Lists sprints for a board, paginating through `startAt` as needed.
@@ -458,50 +505,90 @@ export class JiraAgileClient {
      * in no sprint. Sprint planning starts here, and without it the only way to
      * see candidate work was to reconstruct the board's filter as JQL.
      */
-    async getBoardBacklog(boardId: number, limit = 50): Promise<JiraBoardIssueSummary[]> {
-        return this.mapBoardIssues(
-            await this.getPaginatedValues(
-                `/rest/agile/1.0/board/${boardId}/backlog`,
-                "issues",
-                Math.min(Math.max(limit, 1), 100),
-                { fields: BOARD_ISSUE_FIELDS },
-                "board backlog",
-            ),
+    async getBoardBacklog(boardId: number, limit = 50): Promise<JiraBoardIssueListResult> {
+        return this.getBoardIssueWindow(
+            `/rest/agile/1.0/board/${boardId}/backlog`,
             limit,
+            {},
+            "board backlog",
         );
     }
 
     /** Issues on the board, optionally narrowed by JQL. */
-    async getBoardIssues(boardId: number, options: { jql?: string; limit?: number } = {}): Promise<JiraBoardIssueSummary[]> {
-        const limit = options.limit ?? 50;
-        return this.mapBoardIssues(
-            await this.getPaginatedValues(
-                `/rest/agile/1.0/board/${boardId}/issue`,
-                "issues",
-                Math.min(Math.max(limit, 1), 100),
-                { fields: BOARD_ISSUE_FIELDS, jql: options.jql },
-                "board issue",
-            ),
-            limit,
+    async getBoardIssues(
+        boardId: number,
+        options: { jql?: string; limit?: number } = {},
+    ): Promise<JiraBoardIssueListResult> {
+        return this.getBoardIssueWindow(
+            `/rest/agile/1.0/board/${boardId}/issue`,
+            options.limit ?? 50,
+            { jql: options.jql },
+            "board issue",
         );
     }
 
+    /**
+     * Shared bounded read for the board's issue collections.
+     *
+     * The page budget is a budget on *requests*, so the walk has to stop on the
+     * result count as well: a board with 292 issues answered a request for 5 by
+     * paging 5 at a time until the budget ran out and then failing, which is
+     * the opposite of what a small limit should do. `maxItems` stops the walk;
+     * `hasMore` says the collection continues.
+     */
+    private async getBoardIssueWindow(
+        path: string,
+        requestedLimit: number,
+        query: PaginationQuery,
+        resourceName: string,
+    ): Promise<JiraBoardIssueListResult> {
+        const limit = Math.min(Math.max(requestedLimit, 1), 200);
+        const { values, hasMore, total } = await fetchPaginatedJiraValues({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            maxPaginationPages: this.maxPaginationPages,
+            path,
+            itemProperty: "issues",
+            // Page size is independent of the caller's window: asking for a
+            // small window must not make each page smaller and the walk longer.
+            maxResults: 100,
+            query: { fields: BOARD_ISSUE_FIELDS, ...query },
+            resourceName,
+            maxItems: limit,
+        });
+        return {
+            returned: values.length,
+            total,
+            hasMore,
+            issues: this.mapBoardIssues(values, limit),
+        };
+    }
+
     /** Epics configured on the board, which is how larger work is grouped. */
-    async listBoardEpics(boardId: number, limit = 50): Promise<JiraEpicSummary[]> {
-        const epics = await this.getPaginatedValues(
-            `/rest/agile/1.0/board/${boardId}/epic`,
-            "values",
-            Math.min(Math.max(limit, 1), 100),
-            {},
-            "board epic",
-        );
-        return epics.slice(0, limit).map((epic: unknown) => ({
-            id: readNumber(epic, "id") ?? 0,
-            key: readString(epic, "key"),
-            name: readString(epic, "name"),
-            summary: readString(epic, "summary"),
-            done: readBoolean(epic, "done"),
-        }));
+    async listBoardEpics(boardId: number, limit = 50): Promise<JiraEpicListResult> {
+        const bounded = Math.min(Math.max(limit, 1), 200);
+        const { values, hasMore, total } = await fetchPaginatedJiraValues({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            maxPaginationPages: this.maxPaginationPages,
+            path: `/rest/agile/1.0/board/${boardId}/epic`,
+            itemProperty: "values",
+            maxResults: 50,
+            resourceName: "board epic",
+            maxItems: bounded,
+        });
+        return {
+            returned: values.length,
+            total,
+            hasMore,
+            epics: values.slice(0, bounded).map((epic: unknown) => ({
+                id: readNumber(epic, "id") ?? 0,
+                key: readString(epic, "key"),
+                name: readString(epic, "name"),
+                summary: readString(epic, "summary"),
+                done: readBoolean(epic, "done"),
+            })),
+        };
     }
 
     private mapBoardIssues(issues: unknown[], limit: number): JiraBoardIssueSummary[] {
