@@ -10,6 +10,8 @@ import {
   assertGarbageHandled,
   constantHandler,
   domainError,
+  SKIP_WITHOUT_POSIX_MODES,
+  SKIP_WITHOUT_SYMLINKS,
   withStubServer,
   withTemporaryDirectory as withTemporaryDirectoryIn,
 } from "./testServer.js";
@@ -154,7 +156,7 @@ describe("looksLikeStorageMarkup", () => {
 describe("Confluence attachment filesystem safety", () => {
   // The path-validation rules themselves live in attachmentSecurity.test.ts.
   // What follows checks that the client actually routes through them.
-  test("rejects downloads through a directory symlink that escapes the allowlist", async () => {
+  test("rejects downloads through a directory symlink that escapes the allowlist", { skip: SKIP_WITHOUT_SYMLINKS }, async () => {
     await withTemporaryDirectory(async (directory) => {
       const allowed = join(directory, "allowed");
       const outside = join(directory, "outside");
@@ -210,7 +212,7 @@ describe("Confluence attachment filesystem safety", () => {
     });
   });
 
-  test("revalidates a directory symlink introduced after the initial allowlist check", async () => {
+  test("revalidates a directory symlink introduced after the initial allowlist check", { skip: SKIP_WITHOUT_SYMLINKS }, async () => {
     await withTemporaryDirectory(async (directory) => {
       const allowed = join(directory, "allowed");
       const outside = join(directory, "outside");
@@ -255,7 +257,9 @@ describe("Confluence attachment filesystem safety", () => {
         const result = await client.downloadAttachment("10", "20", outputPath);
         assert.equal(result.bytesWritten, 4);
         assert.equal(await readFile(outputPath, "utf8"), "safe");
-        assert.equal((await stat(outputPath)).mode & 0o777, 0o600);
+        if (!SKIP_WITHOUT_POSIX_MODES) {
+          assert.equal((await stat(outputPath)).mode & 0o777, 0o600);
+        }
       });
     });
   });

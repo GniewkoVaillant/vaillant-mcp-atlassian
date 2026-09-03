@@ -10,11 +10,50 @@
  * incentive to write only happy-path stubs.
  */
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+/* ------------------------------------------------------------------ */
+/* Filesystem capability probes                                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Some of the attachment-safety tests need real filesystem primitives that
+ * Windows does not always provide: creating a symlink requires Developer Mode
+ * or elevation, and NTFS has no POSIX mode bits at all.
+ *
+ * These are probed at runtime rather than switched on `process.platform`, so a
+ * Windows machine that *can* do it still runs the check. The checks themselves
+ * are never weakened — on CI, where both primitives exist, every one of them
+ * runs. Skipping is strictly better than the alternatives here: asserting POSIX
+ * modes on NTFS tests the platform rather than the code, and a suite that
+ * cannot start locally is a suite nobody runs before pushing.
+ */
+function probeSymlinkSupport(): string | false {
+  const directory = mkdtempSync(join(tmpdir(), "mcp-atlassian-symlink-probe-"));
+  try {
+    writeFileSync(join(directory, "target"), "probe");
+    symlinkSync(join(directory, "target"), join(directory, "link"));
+    return false;
+  } catch {
+    return "creating symlinks is not permitted here (Windows without Developer Mode or elevation)";
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+/** `skip` value for a test that needs to create a real symlink. */
+export const SKIP_WITHOUT_SYMLINKS: string | false = probeSymlinkSupport();
+
+/** `skip` value for a test that asserts POSIX file mode bits. */
+export const SKIP_WITHOUT_POSIX_MODES: string | false =
+  process.platform === "win32"
+    ? "NTFS has no POSIX mode bits; stat() reports 0o666 for any writable file"
+    : false;
 
 export type RequestRecord = {
   method: string;

@@ -28,6 +28,13 @@ export interface RequestOptions {
   query?: Record<string, string | number | boolean | undefined>;
   body?: unknown;
   /**
+   * Extra request headers merged in *before* authentication and Accept, so a
+   * caller can opt into an API variant (Jira Service Management's
+   * `X-ExperimentalApi`, Confluence's `X-Atlassian-Token`) but can never
+   * override or forge the Authorization header.
+   */
+  headers?: Record<string, string>;
+  /**
    * Maximum accepted response size in bytes, checked against Content-Length
    * before reading and again while streaming. Honoured by both the binary and
    * the JSON helpers; JSON requests fall back to the ATLASSIAN_MAX_JSON_BYTES
@@ -497,6 +504,19 @@ function authHeaders(pat: string, accept: string): Record<string, string> {
 }
 
 /**
+ * Merges caller-supplied headers with the authenticated defaults. The auth and
+ * Accept headers are applied last on purpose: a caller may add `X-ExperimentalApi`
+ * but must not be able to replace the Authorization header with one of its own.
+ */
+function requestHeaders(
+  pat: string,
+  accept: string,
+  extra: Record<string, string> | undefined,
+): Record<string, string> {
+  return { ...(extra ?? {}), ...authHeaders(pat, accept) };
+}
+
+/**
  * Performs a GET request against an Atlassian Data Center REST endpoint,
  * authenticating with the given Personal Access Token.
  * Throws AtlassianHttpError on any non-2xx response.
@@ -508,7 +528,7 @@ export async function atlassianGet<T = any>(options: RequestOptions): Promise<T>
     {
       method: "GET",
       url,
-      headers: authHeaders(options.pat, "application/json"),
+      headers: requestHeaders(options.pat, "application/json", options.headers),
     },
     (response) => decodeJson<T>(response, url, options.maxResponseBytes),
   );
@@ -535,7 +555,7 @@ export async function atlassianGetBinary(options: RequestOptions): Promise<Binar
     {
       method: "GET",
       url,
-      headers: authHeaders(options.pat, "*/*"),
+      headers: requestHeaders(options.pat, "*/*", options.headers),
     },
     async (response) => ({
       data: await readBoundedBody(response, limit),
@@ -553,7 +573,7 @@ async function atlassianWrite<T>(method: "POST" | "PUT", options: RequestOptions
       method,
       url,
       headers: {
-        ...authHeaders(options.pat, "application/json"),
+        ...requestHeaders(options.pat, "application/json", options.headers),
         "Content-Type": "application/json",
       },
       body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
@@ -586,7 +606,7 @@ export async function atlassianPostFormData<T = any>(
       method: "POST",
       url,
       headers: {
-        ...authHeaders(options.pat, "application/json"),
+        ...requestHeaders(options.pat, "application/json", options.headers),
         "X-Atlassian-Token": "no-check",
       },
       body: options.body,
@@ -618,7 +638,7 @@ export async function atlassianDelete<T = any>(options: RequestOptions): Promise
     {
       method: "DELETE",
       url,
-      headers: authHeaders(options.pat, "application/json"),
+      headers: requestHeaders(options.pat, "application/json", options.headers),
     },
     (response) => decodeJson<T>(response, url, options.maxResponseBytes),
   );

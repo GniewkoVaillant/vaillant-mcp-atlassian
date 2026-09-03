@@ -93,6 +93,26 @@ describe("httpClient success paths", () => {
     });
   });
 
+  test("caller headers opt into an API variant but cannot displace authentication", async () => {
+    await withStubServer(scriptedHandler([{ body: "{}" }]), async (baseUrl, requests) => {
+      await atlassianGet({
+        baseUrl,
+        pat,
+        path: "/rest/servicedeskapi/request",
+        headers: {
+          "X-ExperimentalApi": "opt-in",
+          // A forged Authorization header must lose to the real one, or a
+          // caller could silently downgrade or replace the configured identity.
+          Authorization: "Bearer forged-token",
+        },
+      });
+
+      assert.equal(requests[0]?.headers["x-experimentalapi"], "opt-in");
+      assert.notEqual(requests[0]?.headers.authorization, "Bearer forged-token");
+      assert.equal(requests[0]?.headers.accept, "application/json");
+    });
+  });
+
   test("GET appends query parameters and omits undefined values entirely", async () => {
     await withStubServer(scriptedHandler([{ body: "{}" }]), async (baseUrl, requests) => {
       await atlassianGet({

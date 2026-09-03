@@ -171,7 +171,36 @@ describe("loadConfig profile parsing", () => {
     setRequiredEnv();
     process.env.ATLASSIAN_PROFILE = "ppm";
 
-    assert.deepEqual(groupNames(loadConfig().enabledGroups), ["core", "files", "forms", "links", "write"]);
+    assert.deepEqual(
+      groupNames(loadConfig().enabledGroups),
+      ["core", "files", "forms", "links", "meta", "users", "write"],
+    );
+  });
+
+  test("the classic profile reproduces the pre-expansion surface", () => {
+    setRequiredEnv();
+    process.env.ATLASSIAN_PROFILE = "classic";
+
+    // An existing deployment must be able to keep its old tools/list payload
+    // without hand-maintaining a group list as new groups are added.
+    assert.deepEqual(
+      groupNames(loadConfig().enabledGroups),
+      ["agile", "core", "dev", "files", "forms", "links", "write"],
+    );
+  });
+
+  test("the full profile really means every group", () => {
+    setRequiredEnv();
+    process.env.ATLASSIAN_PROFILE = "full";
+
+    assert.deepEqual(groupNames(loadConfig().enabledGroups), [...ALL_TOOL_GROUPS].sort());
+  });
+
+  test("the service profile exposes the service desk and the directory it needs", () => {
+    setRequiredEnv();
+    process.env.ATLASSIAN_PROFILE = "service";
+
+    assert.deepEqual(groupNames(loadConfig().enabledGroups), ["core", "servicedesk", "users"]);
   });
 
   test("comma-separated raw groups work and always include core", () => {

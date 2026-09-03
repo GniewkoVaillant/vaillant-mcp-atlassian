@@ -9,7 +9,18 @@ import { DEFAULT_MAX_ATTACHMENT_BYTES } from "./attachmentSecurity.js";
 import { DEFAULT_MAX_JSON_BYTES } from "./httpClient.js";
 
 /** Tool groups that can be enabled/disabled to control the tools/list payload. */
-export type ToolGroup = "core" | "forms" | "write" | "files" | "links" | "agile" | "dev";
+export type ToolGroup =
+  | "core"
+  | "forms"
+  | "write"
+  | "files"
+  | "links"
+  | "agile"
+  | "dev"
+  | "meta"
+  | "users"
+  | "filters"
+  | "servicedesk";
 
 export const ALL_TOOL_GROUPS: ToolGroup[] = [
   "core",
@@ -19,13 +30,27 @@ export const ALL_TOOL_GROUPS: ToolGroup[] = [
   "links",
   "agile",
   "dev",
+  "meta",
+  "users",
+  "filters",
+  "servicedesk",
 ];
 
-/** Named profiles mapping to a set of tool groups. */
+/**
+ * Named profiles mapping to a set of tool groups.
+ *
+ * `full` genuinely means every group, and the surface is now large enough that
+ * the whole catalogue costs real context on every request. `classic` reproduces
+ * the seven groups that existed before the metadata/directory/filter/JSM
+ * expansion, so an existing deployment can keep its previous payload size
+ * without pinning a hand-written group list.
+ */
 const PROFILES: Record<string, ToolGroup[]> = {
   full: ALL_TOOL_GROUPS,
-  ppm: ["core", "forms", "write", "files", "links"],
-  agile: ["core", "agile", "dev"],
+  classic: ["core", "forms", "write", "files", "links", "agile", "dev"],
+  ppm: ["core", "forms", "write", "files", "links", "meta", "users"],
+  agile: ["core", "agile", "dev", "meta", "users"],
+  service: ["core", "servicedesk", "users"],
   // Registration still removes writes; including every group preserves all
   // read-only discovery tools, even those historically grouped with writes.
   read: ALL_TOOL_GROUPS,

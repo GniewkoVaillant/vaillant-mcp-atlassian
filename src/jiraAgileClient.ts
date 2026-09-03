@@ -1,10 +1,11 @@
 /**
- * Read-only client for the Jira Agile REST API (`/rest/agile/1.0`), used for
- * board/sprint/velocity reporting on Jira Data Center. Authenticates with the
- * same Personal Access Token as the regular REST API client — Agile endpoints
- * on Data Center require no additional scopes.
+ * Client for the Jira Agile REST API (`/rest/agile/1.0`) on Jira Data Center:
+ * board/sprint/velocity reporting, plus the backlog and sprint writes that turn
+ * a report into a plan. Authenticates with the same Personal Access Token as the
+ * regular REST API client — Agile endpoints on Data Center require no additional
+ * scopes.
  */
-import { atlassianGet } from "./httpClient.js";
+import { atlassianDelete, atlassianGet, atlassianPost, atlassianPut } from "./httpClient.js";
 import { DEFAULT_CONCURRENCY, mapWithConcurrency } from "./concurrency.js";
 import {
     fetchPaginatedJiraValues,
@@ -40,6 +41,30 @@ export interface JiraSprintSummary {
 export interface JiraStoryPointsFieldInfo {
     fieldId: string | null;
     fieldName: string | null;
+}
+
+export interface JiraBoardIssueSummary {
+    key: string;
+    summary: string;
+    status: string;
+    issueType: string;
+    assignee: string;
+    priority: string;
+}
+
+export interface JiraEpicSummary {
+    id: number;
+    key: string;
+    name: string;
+    summary: string;
+    done: boolean;
+}
+
+/** Outcome of a backlog/sprint move or a rank change. */
+export interface JiraIssueMoveResult {
+    moved: number;
+    issueKeys: string[];
+    destination: string;
 }
 
 export interface JiraSprintIssueSummary {
@@ -425,5 +450,220 @@ export class JiraAgileClient {
                 ? round2(completedValues.reduce((a, b) => a + b, 0) / completedValues.length)
                 : null,
         };
+    }
+
+    /**
+     * Lists the board's backlog — the issues that belong to the board but sit
+     * in no sprint. Sprint planning starts here, and without it the only way to
+     * see candidate work was to reconstruct the board's filter as JQL.
+     */
+    async getBoardBacklog(boardId: number, limit = 50): Promise<JiraBoardIssueSummary[]> {
+        return this.mapBoardIssues(
+            await this.getPaginatedValues(
+                `/rest/agile/1.0/board/${boardId}/backlog`,
+                "issues",
+                Math.min(Math.max(limit, 1), 100),
+                { fields: BOARD_ISSUE_FIELDS },
+                "board backlog",
+            ),
+            limit,
+        );
+    }
+
+    /** Issues on the board, optionally narrowed by JQL. */
+    async getBoardIssues(boardId: number, options: { jql?: string; limit?: number } = {}): Promise<JiraBoardIssueSummary[]> {
+        const limit = options.limit ?? 50;
+        return this.mapBoardIssues(
+            await this.getPaginatedValues(
+                `/rest/agile/1.0/board/${boardId}/issue`,
+                "issues",
+                Math.min(Math.max(limit, 1), 100),
+                { fields: BOARD_ISSUE_FIELDS, jql: options.jql },
+                "board issue",
+            ),
+            limit,
+        );
+    }
+
+    /** Epics configured on the board, which is how larger work is grouped. */
+    async listBoardEpics(boardId: number, limit = 50): Promise<JiraEpicSummary[]> {
+        const epics = await this.getPaginatedValues(
+            `/rest/agile/1.0/board/${boardId}/epic`,
+            "values",
+            Math.min(Math.max(limit, 1), 100),
+            {},
+            "board epic",
+        );
+        return epics.slice(0, limit).map((epic: any) => ({
+            id: epic?.id,
+            key: epic?.key || "",
+            name: epic?.name || "",
+            summary: epic?.summary || "",
+            done: epic?.done === true,
+        }));
+    }
+
+    private mapBoardIssues(issues: any[], limit: number): JiraBoardIssueSummary[] {
+        return issues.slice(0, limit).map((issue: any) => {
+            const fields = issue?.fields ?? {};
+            return {
+                key: issue?.key || "",
+                summary: fields.summary || "",
+                status: fields.status?.name || "Unknown",
+                issueType: fields.issuetype?.name || "Unknown",
+                assignee: fields.assignee?.displayName || fields.assignee?.name || "Unassigned",
+                priority: fields.priority?.name || "Unknown",
+            };
+        });
+    }
+
+    /**
+     * Creates a sprint in the future state on a board. Mutates data: POST
+     * /rest/agile/1.0/sprint. Jira starts a sprint only through an explicit
+     * state change, so creating one here is safe to undo by deleting it.
+     */
+    async createSprint(options: {
+        name: string;
+        originBoardId: number;
+        goal?: string;
+        startDate?: string;
+        endDate?: string;
+    }): Promise<JiraSprintSummary> {
+        const created = await atlassianPost({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: "/rest/agile/1.0/sprint",
+            body: {
+                name: options.name,
+                originBoardId: options.originBoardId,
+                goal: options.goal,
+                startDate: options.startDate,
+                endDate: options.endDate,
+            },
+        });
+        return toSprintSummary(created);
+    }
+
+    /**
+     * Partially updates a sprint. Mutates data: POST /rest/agile/1.0/sprint/{id},
+     * which is Jira's documented partial update — PUT replaces the sprint
+     * wholesale and would silently clear any field not repeated in the body.
+     *
+     * Moving `state` to "closed" completes the sprint for everyone and pushes
+     * unfinished work out of it, so the tool exposing this marks it destructive.
+     */
+    async updateSprint(sprintId: number, options: {
+        name?: string;
+        goal?: string;
+        state?: "future" | "active" | "closed";
+        startDate?: string;
+        endDate?: string;
+    }): Promise<JiraSprintSummary> {
+        const updated = await atlassianPost({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/agile/1.0/sprint/${sprintId}`,
+            body: {
+                name: options.name,
+                goal: options.goal,
+                state: options.state,
+                startDate: options.startDate,
+                endDate: options.endDate,
+            },
+        });
+        return toSprintSummary(updated);
+    }
+
+    async deleteSprint(sprintId: number): Promise<{ id: number; deleted: true }> {
+        await atlassianDelete({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/agile/1.0/sprint/${sprintId}`,
+        });
+        return { id: sprintId, deleted: true };
+    }
+
+    /**
+     * Moves issues into a sprint. Mutates data: POST
+     * /rest/agile/1.0/sprint/{id}/issue. Jira itself refuses more than
+     * MAX_ISSUES_PER_MOVE keys per call, so the limit is enforced here with a
+     * message that says what to do instead of relaying an opaque 400.
+     */
+    async moveIssuesToSprint(sprintId: number, issueKeys: string[]): Promise<JiraIssueMoveResult> {
+        assertMovableBatch(issueKeys);
+        await atlassianPost({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/agile/1.0/sprint/${sprintId}/issue`,
+            body: { issues: issueKeys },
+        });
+        return { moved: issueKeys.length, issueKeys, destination: `sprint ${sprintId}` };
+    }
+
+    /** Moves issues out of any sprint and back to the backlog. */
+    async moveIssuesToBacklog(issueKeys: string[]): Promise<JiraIssueMoveResult> {
+        assertMovableBatch(issueKeys);
+        await atlassianPost({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: "/rest/agile/1.0/backlog/issue",
+            body: { issues: issueKeys },
+        });
+        return { moved: issueKeys.length, issueKeys, destination: "backlog" };
+    }
+
+    /**
+     * Re-ranks issues relative to another issue. Mutates data: PUT
+     * /rest/agile/1.0/issue/rank. Exactly one of rankBeforeIssue/rankAfterIssue
+     * must be given; passing neither reorders nothing and passing both is
+     * ambiguous, so both cases are refused before the request is sent.
+     */
+    async rankIssues(options: {
+        issueKeys: string[];
+        rankBeforeIssue?: string;
+        rankAfterIssue?: string;
+        rankCustomFieldId?: number;
+    }): Promise<JiraIssueMoveResult> {
+        assertMovableBatch(options.issueKeys);
+        const anchors = [options.rankBeforeIssue, options.rankAfterIssue].filter(Boolean);
+        if (anchors.length !== 1) {
+            throw new Error("Ranking requires exactly one of rankBeforeIssue or rankAfterIssue.");
+        }
+        await atlassianPut({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: "/rest/agile/1.0/issue/rank",
+            body: {
+                issues: options.issueKeys,
+                rankBeforeIssue: options.rankBeforeIssue,
+                rankAfterIssue: options.rankAfterIssue,
+                rankCustomFieldId: options.rankCustomFieldId,
+            },
+        });
+        return {
+            moved: options.issueKeys.length,
+            issueKeys: options.issueKeys,
+            destination: options.rankBeforeIssue
+                ? `before ${options.rankBeforeIssue}`
+                : `after ${options.rankAfterIssue}`,
+        };
+    }
+}
+
+/** Fields requested for board/backlog issue listings — enough to triage, no more. */
+const BOARD_ISSUE_FIELDS = "summary,status,issuetype,assignee,priority";
+
+/** Jira Agile refuses more than 50 issue keys in one move or rank request. */
+const MAX_ISSUES_PER_MOVE = 50;
+
+function assertMovableBatch(issueKeys: string[]): void {
+    if (issueKeys.length === 0) {
+        throw new Error("At least one issue key is required.");
+    }
+    if (issueKeys.length > MAX_ISSUES_PER_MOVE) {
+        throw new Error(
+            `Jira Agile accepts at most ${MAX_ISSUES_PER_MOVE} issues per request; ` +
+            `${issueKeys.length} were supplied. Split the batch and repeat the call.`,
+        );
     }
 }

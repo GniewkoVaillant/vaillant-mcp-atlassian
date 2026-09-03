@@ -306,3 +306,141 @@ and network design, acceptance tests, release gates and rollback procedure are
 recorded in `AZURE-DEPLOYMENT.md`. Trust boundaries remain in
 `SECURITY-ARCHITECTURE.md`; repository collaboration rules are recorded in the
 project-root `AGENTS.md`.
+
+## 9. API coverage expansion
+
+### The gap
+
+The server covered issue reading, ProForma, agile reporting and Confluence
+content well, and almost nothing else Jira and Confluence publish. Three
+consequences mattered:
+
+1. **The write tools operated blind.** `jira_create_issue` and
+   `jira_update_issue` accepted a project, an issue type and a field bag with no
+   way to discover what that screen actually requires. Jira answers a bare 400
+   naming a custom field ID, which an agent cannot act on.
+2. **Every person-shaped argument was unresolvable.** `jira_assign_issue`,
+   `jira_add_watcher` and filter sharing all take a Data Center *username*,
+   which rarely matches the display name anyone knows. Nothing could translate
+   one into the other.
+3. **Whole product areas were invisible.** Saved filters, Service Management
+   queues and SLAs, backlog and sprint planning, Confluence labels, spaces,
+   version history and trash had no representation at all.
+
+### What was added
+
+Seven registration modules under `src/tools/`, backed by four new clients and
+extensions to three existing ones. The tool count went from 48 to 133 (150 with
+the destructive opt-in).
+
+| Area | Client | Notable capability |
+|---|---|---|
+| Metadata and project configuration | `jiraMetaClient.ts` | `createmeta`/`editmeta`, field catalogue, dictionaries, JQL autocomplete, version and component CRUD |
+| User and group directory | `jiraDirectoryClient.ts` | user search, assignable-user search, group members, effective permissions — read-only |
+| Saved filters and dashboards | `jiraFilterClient.ts` | filter CRUD, share permissions, favourites, dashboards |
+| Agile planning | `jiraAgileClient.ts` (extended) | backlog, board issues, epics, sprint CRUD, sprint/backlog moves, ranking |
+| Service Management | `jiraServiceDeskClient.ts` | service desks, request types and their fields, queues, SLAs, approvals, request creation and comments |
+| Issue extras | `jiraClient.ts` (extended) | bulk create, remote links, notifications, votes, worklog edits, issue properties |
+| Confluence | `confluenceClient.ts` (extended) | global search, page hierarchy, export, version read and restore, move, spaces, labels, restrictions (read), content properties, watches, trash, uploads |
+
+`index.ts` keeps the policy gate and the original tool set; each new module
+receives the same registrar, so the decision about what is exposed still lives in
+exactly one place.
+
+### Endpoints verified rather than assumed
+
+Data Center diverges from Cloud in ways that are easy to get wrong, so the
+endpoint set was checked against Atlassian's Data Center references (Jira
+platform 9.12, Jira Software agile, JSM 5.12, Confluence 8.5) before
+implementation. Four findings changed the design:
+
+- **`/rest/api/2/filter/search` does not exist on Jira DC 9.x.**
+  `jira_search_filters` therefore degrades to filtering the caller's favourites
+  and reports `source` so a short answer is not mistaken for "no such filter".
+- **The v2 filter resource has no favourite sub-resource.** Atlassian's own
+  documentation redirects to `/rest/api/1.0/filters/{id}/favourite`, which is
+  what `jira_set_filter_favourite` uses.
+- **Confluence DC documents no restriction *write* endpoint** — only
+  `restriction/byOperation` reads — and no endpoint that lists a page's
+  watchers. Both are exposed read-only or not at all rather than implemented
+  against a Cloud path that would fail. Page templates are likewise Cloud-only.
+- **Jira 9 removed the global `createmeta`.** `jira_get_create_meta` tries the
+  legacy endpoint, falls back to the per-project pair on 404/410, and reports
+  which answered.
+
+### Rich Filters: deliberately not implemented
+
+The request that started this work named `jira_create_rich_filter` and
+`jira_get_rich_filter`. Those are not Jira APIs. They belong to the Marketplace
+app *Rich Filters for Jira Dashboards* (`com.qotilabs.jira.rich-filters-plugin`,
+originally Digital Toucan / Qoti Labs, now published by Appfire).
+
+The app publishes **no public REST API**. A Marketplace metadata check found no
+API documentation module, the vendor's old documentation host no longer
+resolves, and a GitHub-wide code search for a plausible `rest/rf/1.0` base path
+returned nothing. Implementing against a guessed namespace would produce tools
+that fail on every instance, or worse, silently hit an internal endpoint with no
+compatibility guarantee. The correct next step, if this is still wanted, is to
+read the installed app's `atlassian-plugin.xml` for its `<rest>` module and ask
+Appfire whether that namespace is supported.
+
+### Defect found while testing
+
+`confluence_restore_page_version` initially compared the historical version
+against the *next* version number rather than the current one, so restoring the
+live version would have been accepted: a no-op PUT that burns a page version and
+notifies every watcher. The regression test now pins the correct comparison.
+
+### Test-suite portability
+
+`serverPolicy.test.ts` could not boot the server on Windows at all — it passed
+`URL.pathname` to `spawn`, which yields `/C:/…`. That was pre-existing and
+unrelated to this work, but it blocked verifying the new registrations
+end-to-end, so it was fixed with `fileURLToPath`.
+
+Two attachment-safety assertions interpolated a filesystem path straight into a
+`RegExp`. On Windows the backslashes became regex escapes, so the test failed
+against an error message that was in fact correct — a false negative that would
+have hidden a real regression. Both now escape the path.
+
+Tests that need real symlinks or POSIX mode bits are gated on a runtime
+capability probe (`SKIP_WITHOUT_SYMLINKS`, `SKIP_WITHOUT_POSIX_MODES`) rather
+than weakened, so they run in full on CI and on any machine that supports them.
+Five tests remain Windows-incompatible by nature (FIFO, unix domain socket and
+character-device refusal, colon-delimited path parsing); Linux/CI is the
+authoritative gate.
+
+### Verified results
+
+| Check | Result |
+|---|---|
+| Strict TypeScript check | `tsc -p tsconfig.json --noEmit` passed |
+| Lint | `npm run lint`: 0 errors |
+| Unit tests | 481 tests; 464–465 passed; 5 deterministic failures; 11 skipped |
+| Unit-test failures | POSIX-only cases (FIFO, unix domain socket, character device, colon path delimiter) that cannot run on Windows at all; the two files carrying them went from 14 failures on `main` to 5 on this branch, and the difference is defects fixed here, not checks removed. One timing-sensitive HTTP retry test (`POST is not retried after timing out`) also fails intermittently on this machine, on `main` as well |
+| New tests | 37 added across `jiraExtendedClients.test.ts`, `confluenceExtended.test.ts`, `config.test.ts` and `httpClient.test.ts` |
+| Default MCP surface | 133 tools; approximately 30,200 tokens |
+| `classic` profile | 86 tools; approximately 20,100 tokens |
+| `ppm` profile | 94 tools; approximately 21,100 tokens |
+| `agile` profile | 66 tools; approximately 14,200 tokens |
+| `service` profile | 42 tools; approximately 9,100 tokens |
+| `read` profile | 85 tools; 0 mutations; approximately 17,100 tokens |
+| `core` profile | 24 tools; approximately 4,900 tokens |
+| Explicit destructive opt-in | 150 tools; 17 destructive tools; approximately 33,500 tokens |
+| Read-only plus destructive opt-in | 85 tools; 0 destructive tools — read-only still wins |
+| Live Jira/Confluence traffic | **Not performed.** No endpoint added here has been exercised against a real Data Center instance |
+| Deployment | Not performed |
+
+### Residual risk
+
+Every new endpoint is verified against documentation and synthetic servers, not
+against a live instance. Data Center versions differ, apps alter behaviour, and
+permissions vary per project and space. Before relying on the write tools in
+anger, run `ATLASSIAN_SMOKE_LIVE=true npm run test:smoke` against the target
+instance and exercise the specific tools you intend to use on a scratch project
+and a scratch space — particularly `jira_bulk_create_issues`, the sprint writes
+and anything touching Confluence spaces.
+
+Context cost is the other live risk. At 133 tools the default profile spends
+roughly 30k tokens on tool definitions before any question is asked. Choose a
+profile.

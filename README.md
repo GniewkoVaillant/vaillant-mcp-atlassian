@@ -98,24 +98,27 @@ appropriate only for local single-user development, never shared Azure hosting.
 
 ### Tool profiles
 
-Every exposed tool costs context on **every** model request. Narrow the surface
-to what you actually use; `npm run test:smoke` reports the current tool count
-and an approximate context cost.
+Every exposed tool costs context on **every** model request, and the surface is
+now large: the default `full` profile is 133 tools and roughly 30k tokens of
+tool definitions before a single question is asked. **Narrow it.** Most work
+needs one or two groups, and `npm run test:smoke` reports the current tool count
+and an approximate context cost for whatever you configured.
 
-| Profile | Groups | Use case |
-|---|---|---|
-| `full` | everything | default |
-| `ppm` | core, forms, write, files, links | PPM/project audits |
-| `agile` | core, agile, dev | sprint and velocity reporting |
-| `read` | all groups, read-only tools only | enforced read-only analysis including worklogs and attachment listings |
-| `core` | core | issue and page lookup only |
+| Profile | Groups | Tools | ≈ tokens | Use case |
+|---|---|---|---|---|
+| `full` | everything | 133 | 30,200 | default; usually more than you need |
+| `classic` | core, forms, write, files, links, agile, dev | 86 | 20,100 | the surface as it was before the metadata/directory/filter/JSM expansion |
+| `ppm` | core, forms, write, files, links, meta, users | 94 | 21,100 | PPM/project audits and issue work |
+| `agile` | core, agile, dev, meta, users | 66 | 14,200 | sprint planning, velocity and delivery reporting |
+| `service` | core, servicedesk, users | 42 | 9,100 | Jira Service Management queues, SLAs and approvals |
+| `read` | all groups, read-only tools only | 85 | 17,100 | enforced read-only analysis |
+| `core` | core | 24 | 4,900 | issue and page lookup only |
 
-You can also pass a raw comma-separated group list, e.g. `ATLASSIAN_PROFILE=core,agile`. The `core` group is always included.
+Explicit destructive opt-in raises `full` to 150 tools and approximately 33,500
+tokens.
 
-Verified current discovery payloads are approximately 10,754 tokens for the
-default `full` profile (48 tools), 8,582 for `ppm` (39 tools), and 6,296 for
-`read` (30 read-only tools). Explicit destructive opt-in raises `full` to 54
-tools and approximately 11,802 tokens.
+You can also pass a raw comma-separated group list, e.g.
+`ATLASSIAN_PROFILE=core,agile`. The `core` group is always included.
 
 ### Safety
 
@@ -123,16 +126,26 @@ MCP annotations describe a tool to the client; **they are not authorization**.
 Jira descriptions, comments and Confluence pages are untrusted input and may
 contain prompt-injection attempts. Actual safeguards are enforced server-side:
 
-- Delete tools are absent unless `ATLASSIAN_ALLOW_DESTRUCTIVE=true` is explicitly configured.
-  That flag is the gate, and it governs exactly the six `*_delete_*` tools. It is
-  not the same thing as the `destructiveHint` annotation: seven overwriting tools
-  (`jira_update_issue`, `jira_assign_issue`, `jira_edit_comment`,
-  `jira_remove_watcher`, `jira_transition_issue`, `confluence_update_comment`,
-  `confluence_update_page`) also carry `destructiveHint: true`, because they
-  replace existing data in place. The hint describes behaviour to the client; it
-  withholds nothing. Those seven remain registered with
-  `ATLASSIAN_ALLOW_DESTRUCTIVE=false` and are removed only by
-  `ATLASSIAN_READ_ONLY=true` or `ATLASSIAN_PROFILE=read`.
+- Destructive tools are absent unless `ATLASSIAN_ALLOW_DESTRUCTIVE=true` is explicitly
+  configured. That flag is the gate, and it governs exactly 17 tools: the eleven
+  `*_delete_*` tools plus `confluence_purge_from_trash`, `confluence_remove_label`,
+  `jira_delete_filter_permission`, `jira_set_issue_property` and
+  `confluence_set_content_property`. The last two are gated because issue and
+  content properties are where installed apps (ProForma among them) keep their
+  own state, so overwriting one destroys those records with no version history
+  and no undo.
+
+  This is not the same thing as the `destructiveHint` annotation: sixteen
+  overwriting tools also carry `destructiveHint: true` because they replace
+  existing data in place — `jira_update_issue`, `jira_assign_issue`,
+  `jira_edit_comment`, `jira_remove_watcher`, `jira_transition_issue`,
+  `jira_update_version`, `jira_update_component`, `jira_update_filter`,
+  `jira_update_worklog`, `jira_update_sprint`, `confluence_update_comment`,
+  `confluence_update_page`, `confluence_update_space`, `confluence_move_page`,
+  `confluence_restore_page_version` and `confluence_update_attachment_data`.
+  The hint describes behaviour to the client; it withholds nothing. Those
+  sixteen remain registered with `ATLASSIAN_ALLOW_DESTRUCTIVE=false` and are
+  removed only by `ATLASSIAN_READ_ONLY=true` or `ATLASSIAN_PROFILE=read`.
 - `ATLASSIAN_READ_ONLY=true` removes all mutating and local-filesystem tools;
   `ATLASSIAN_PROFILE=read` also forces read-only mode. Local-filesystem tools
   means `jira_download_attachment` and `confluence_download_attachment` are
@@ -162,16 +175,35 @@ production-gated Azure/Entra deployment design is in
 
 | Group | Tools |
 |---|---|
-| `core` | `jira_list_projects`, `jira_search_issues`, `jira_get_issue`, `jira_get_issue_fields`, `confluence_list_spaces`, `confluence_search_pages`, `confluence_get_page`, `confluence_get_page_by_title`, `confluence_get_page_children`, `confluence_list_comments`, `confluence_get_page_history` |
+| `core` | `jira_list_projects`, `jira_search_issues`, `jira_get_issue`, `jira_get_issue_fields`, `confluence_list_spaces`, `confluence_search_pages`, `confluence_search`, `confluence_get_page`, `confluence_get_page_by_title`, `confluence_get_page_children`, `confluence_get_page_ancestors`, `confluence_get_page_descendants`, `confluence_get_page_version`, `confluence_export_page`, `confluence_get_space`, `confluence_list_space_content`, `confluence_list_comments`, `confluence_get_page_history`, `confluence_list_labels`, `confluence_get_restrictions`, `confluence_list_content_properties`, `confluence_get_content_property`, `confluence_is_watching_page`, `confluence_list_trashed_pages` |
 | `forms` | `jira_list_proforma_forms`, `jira_get_proforma_form`, `jira_get_proforma_forms_summary` |
-| `write` | `jira_create_issue`, `jira_update_issue`, `jira_assign_issue`, `jira_get_transitions`, `jira_add_comment`, `jira_edit_comment`, `jira_delete_comment`, `jira_transition_issue`, `jira_list_worklogs`, `jira_delete_worklog`, `jira_list_watchers`, `jira_add_watcher`, `jira_remove_watcher`, `jira_add_worklog`, `jira_add_worklog_with_category`, `confluence_create_page`, `confluence_update_page`, `confluence_add_comment`, `confluence_update_comment`, `confluence_delete_comment`, `confluence_delete_page` |
-| `files` | `jira_list_attachments`, `jira_download_attachment`, `jira_upload_attachment`, `jira_delete_attachment`, `confluence_list_attachments`, `confluence_download_attachment` |
-| `links` | `jira_list_issue_link_types`, `jira_get_issue_links`, `jira_create_issue_link`, `jira_delete_issue_link` |
-| `agile` | `jira_list_boards`, `jira_get_board_sprints`, `jira_get_sprint_report`, `jira_get_board_velocity`, `jira_get_issues_story_points` |
+| `meta` | `jira_list_fields`, `jira_get_create_meta`, `jira_get_edit_meta`, `jira_list_issue_types`, `jira_list_priorities`, `jira_list_resolutions`, `jira_list_statuses`, `jira_get_project`, `jira_list_project_components`, `jira_list_project_versions`, `jira_list_project_statuses`, `jira_list_project_roles`, `jira_get_jql_autocomplete`, `jira_get_jql_suggestions`, `jira_get_myself`, `jira_create_version`, `jira_update_version`, `jira_delete_version`, `jira_create_component`, `jira_update_component`, `jira_delete_component` |
+| `users` | `jira_search_users`, `jira_find_assignable_users`, `jira_get_user`, `jira_list_group_members`, `jira_find_groups`, `jira_get_my_permissions` |
+| `filters` | `jira_list_favourite_filters`, `jira_search_filters`, `jira_get_filter`, `jira_get_filter_permissions`, `jira_list_dashboards`, `jira_get_dashboard`, `jira_create_filter`, `jira_update_filter`, `jira_set_filter_favourite`, `jira_add_filter_permission`, `jira_delete_filter_permission`, `jira_delete_filter` |
+| `write` | `jira_create_issue`, `jira_bulk_create_issues`, `jira_update_issue`, `jira_assign_issue`, `jira_get_transitions`, `jira_add_comment`, `jira_edit_comment`, `jira_delete_comment`, `jira_transition_issue`, `jira_notify_issue`, `jira_get_issue_votes`, `jira_set_issue_vote`, `jira_list_worklogs`, `jira_add_worklog`, `jira_add_worklog_with_category`, `jira_update_worklog`, `jira_delete_worklog`, `jira_list_watchers`, `jira_add_watcher`, `jira_remove_watcher`, `jira_list_issue_properties`, `jira_set_issue_property`, `confluence_create_page`, `confluence_update_page`, `confluence_move_page`, `confluence_restore_page_version`, `confluence_add_comment`, `confluence_update_comment`, `confluence_delete_comment`, `confluence_delete_page`, `confluence_create_space`, `confluence_update_space`, `confluence_delete_space`, `confluence_add_labels`, `confluence_remove_label`, `confluence_set_content_property`, `confluence_set_page_watch`, `confluence_restore_from_trash`, `confluence_purge_from_trash` |
+| `files` | `jira_list_attachments`, `jira_download_attachment`, `jira_upload_attachment`, `jira_delete_attachment`, `confluence_list_attachments`, `confluence_download_attachment`, `confluence_upload_attachment`, `confluence_update_attachment_data` |
+| `links` | `jira_list_issue_link_types`, `jira_get_issue_links`, `jira_create_issue_link`, `jira_delete_issue_link`, `jira_list_remote_links`, `jira_create_remote_link`, `jira_delete_remote_link` |
+| `agile` | `jira_list_boards`, `jira_get_board_sprints`, `jira_get_board_backlog`, `jira_get_board_issues`, `jira_list_board_epics`, `jira_get_sprint_report`, `jira_get_board_velocity`, `jira_get_issues_story_points`, `jira_create_sprint`, `jira_update_sprint`, `jira_delete_sprint`, `jira_move_issues_to_sprint`, `jira_move_issues_to_backlog`, `jira_rank_issues` |
 | `dev` | `jira_get_issue_changelog`, `jira_get_issue_cycle_time`, `jira_get_issue_dev_status`, `jira_get_issues_dev_status` |
+| `servicedesk` | `jsm_list_service_desks`, `jsm_list_request_types`, `jsm_get_request_type_fields`, `jsm_list_requests`, `jsm_get_request`, `jsm_list_queues`, `jsm_get_request_sla`, `jsm_list_approvals`, `jsm_list_request_comments`, `jsm_create_request`, `jsm_add_request_comment`, `jsm_answer_approval` |
 
-Every `*_delete_*` tool listed above is excluded from the actual MCP tool surface
+Every destructive tool listed above is excluded from the actual MCP tool surface
 unless destructive tools are explicitly enabled.
+
+### Not exposed, and why
+
+These are absent on purpose rather than by omission. Each is either undocumented
+on Data Center or too dangerous to drive from a prompt:
+
+| Capability | Reason |
+|---|---|
+| Setting Confluence page restrictions | Confluence Data Center's REST reference documents only the `byOperation` **read** endpoints. There is no supported write path, and an access-control API is the wrong place to guess one. Reading restrictions is supported (`confluence_get_restrictions`). |
+| Listing a Confluence page's watchers | No Data Center endpoint publishes it. Only the token owner's own subscription is visible, via `confluence_is_watching_page`. |
+| Confluence space permissions | No REST resource exists on Data Center; the historical alternative is the deprecated JSON-RPC API. |
+| Confluence page templates and blueprints | `/rest/api/template/*` is Cloud-only and absent from the Data Center reference. |
+| Jira dashboard gadget contents | Data Center exposes dashboards but no gadget-level REST API. |
+| Creating or deactivating Jira users | Identity provisioning has its own audit and approval path; it does not belong behind a chat prompt. |
+| **Rich Filters for Jira Dashboards** | The Marketplace app (`com.qotilabs.jira.rich-filters-plugin`, now published by Appfire) has **no published public REST API**. Any base path would be a guess against an internal, unsupported namespace. If your instance has it installed, its real namespace can only be read from the app's `atlassian-plugin.xml`; ask the vendor for a supported API before anything is built on it. |
 
 ## Architecture
 
@@ -179,9 +211,16 @@ unless destructive tools are explicitly enabled.
 src/
   config.ts            .env loading, profiles, read-only, allowlist
   httpClient.ts        auth, timeouts, retry/backoff, same-origin guard, response budgets
-  jiraClient.ts        issues, fields, ProForma, attachments, links, worklogs
-  jiraAgileClient.ts   boards, sprints, velocity
-  confluenceClient.ts  pages, comments, storage-format conversion (htmlparser2)
+  jiraClient.ts        issues, fields, ProForma, attachments, links, worklogs, bulk create,
+                       remote links, votes, notifications, issue properties
+  jiraMetaClient.ts    create/edit metadata, dictionaries, project configuration, JQL
+                       autocomplete, version and component CRUD
+  jiraDirectoryClient.ts  user and group lookup, effective permissions (read-only)
+  jiraFilterClient.ts  saved filters, share permissions, dashboards
+  jiraAgileClient.ts   boards, sprints, velocity, backlog and sprint writes, ranking
+  jiraServiceDeskClient.ts  JSM requests, queues, SLAs, approvals
+  confluenceClient.ts  pages, comments, spaces, labels, versions, trash, attachments,
+                       storage-format conversion (htmlparser2)
   proforma.ts          chunked base64 form-design decoding
   concurrency.ts       bounded parallelism for batch tools
   attachmentSecurity.ts  the only place that touches the local filesystem: path
@@ -190,7 +229,10 @@ src/
                        raises a domain error naming the resource, never a TypeError
   jiraPagination.ts    the shared Jira paging walk: page budget, stalled-cursor and
                        repeated-page detection; raises rather than returning partial data
-  index.ts             MCP tool registration, per-tool validation, result size clamp
+  index.ts             server bootstrap, the policy gate that decides what is registered,
+                       the original tool set, per-tool validation, result size clamp
+  tools/               tool registration by feature area; every module receives the same
+                       registrar, so the policy decision stays in index.ts alone
 ```
 
 `httpClient.ts` refuses to send credentials to any origin other than the configured base URL, which stops a malicious `content` URL in an API response from exfiltrating the PAT.
@@ -214,10 +256,39 @@ stop after `ATLASSIAN_MAX_PAGINATION_PAGES`; repeated or non-advancing pages are
 rejected rather than returned as misleading, apparently complete results. Hitting
 the page budget raises an error — partial results are never presented as whole.
 
-**An update with no fields is refused.** `jira_update_issue` and
-`confluence_update_page` reject a call that supplies nothing to change, before
-any HTTP request. An empty PUT is not a no-op: it burns a version, an audit
-entry and a watcher notification.
+**An update with no fields is refused.** `jira_update_issue`,
+`confluence_update_page` and every other partial-update tool added since reject a
+call that supplies nothing to change, before any HTTP request. An empty PUT is
+not a no-op: it burns a version, an audit entry and a watcher notification.
+
+**Writes read before they replace.** Several Data Center endpoints replace a
+resource wholesale on update, so an omitted field is a *cleared* field.
+`jira_update_filter`, `jira_update_worklog`, `confluence_update_space` and
+`confluence_restore_page_version` therefore fetch the current state and merge
+before writing. `jira_update_sprint` uses Jira's documented partial-update POST
+for the same reason — the PUT form would blank a sprint's name, goal and dates.
+
+**Batch writes report partial success.** `jira_bulk_create_issues` returns
+`created` and `failed` separately, because Jira applies rows independently and
+answers 201 even when some were rejected. Re-running the whole batch after a
+partial failure duplicates the rows that already succeeded.
+
+**Metadata tools exist so writes stop guessing.** `jira_get_create_meta` and
+`jira_get_edit_meta` report which fields a screen accepts and what values they
+allow; `jira_search_users` and `jira_find_assignable_users` resolve a display
+name into the username every write tool actually wants. Calling them first turns
+an opaque Jira 400 into a decision that can be made before anything is sent.
+`jira_get_create_meta` transparently falls back to Jira 9's per-project
+endpoints when the global one is gone, and reports which answered via `source`.
+
+**Directory and filter reads are capped.** User, group and filter listings are
+hard-capped at 50 results regardless of what is requested. That is a
+data-minimisation limit as much as a token limit: a user search is an easy way
+to pull a company's staff list into a model's context.
+
+**Sharing is always an explicit second step.** `jira_create_filter` creates the
+filter private. Widening its audience requires `jira_add_filter_permission`,
+which grants view rights only and never edit rights.
 
 **`confluence_get_page` output must not be written back.** That tool renders the
 page to lossy plain text. Feeding it to `confluence_update_page` as `body`
@@ -243,9 +314,20 @@ retries and `Retry-After` backoff. Non-idempotent methods are replayed only on
 ## Known limitations
 
 - `jira_add_worklog_with_category` targets the `vaillant-timetracking` plugin and always creates worklogs with status `TRACKED`. There is no REST endpoint to submit them; that still needs the Jira UI.
+- `jira_get_issue` returns only the most recent comments; `commentTotal` reports the real number.
+- Confluence page restrictions can be read but not changed, and a page's watcher
+  list cannot be read at all: Data Center publishes no supported REST endpoint
+  for either. See "Not exposed, and why" above.
+- `jira_search_filters` cannot really search on Jira Data Center 9.x, which has
+  no filter-search endpoint. It degrades to filtering the caller's favourites
+  and says so via `source`; a filter owned by someone else and not favourited is
+  reachable only by its ID.
+- Rich Filters and other Marketplace apps are not covered. Only
+  `vaillant-timetracking` is, because its REST namespace is known; see "Not
+  exposed, and why" above.
 - Confluence storage-format conversion is still lossy for complex or nested
   XHTML, although common tables, links and macro markers are preserved.
-- `jira_get_issue` returns only the most recent comments; `commentTotal` reports the real number.
+  `confluence_export_page` returns fully rendered HTML when fidelity matters.
 - Current stdio deployment is single-user and uses one Jira PAT plus one
   Confluence PAT per server process. Shared Azure hosting, Entra authentication
   and per-user token isolation are designed but not yet implemented. Do not

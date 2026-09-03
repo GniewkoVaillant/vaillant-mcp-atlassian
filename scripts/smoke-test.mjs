@@ -149,16 +149,50 @@ try {
   console.log(`  info  ${destructiveHinted.length} tools hint destructive: ${destructiveHinted.map((t) => t.name).join(", ") || "none"}`);
 
   // The gate is ATLASSIAN_ALLOW_DESTRUCTIVE, and what it withholds are the
-  // delete tools (kind: "destructive"). That is what this check must assert.
-  const deleteTools = tools.filter((tool) => /(^|_)delete_/.test(tool.name));
-  if (!hasRealCredentials && process.env.ATLASSIAN_ALLOW_DESTRUCTIVE !== "true") {
+  // tools registered with kind "destructive". Asserting the exact set rather
+  // than a count keeps this honest: a count silently accepts a tool that was
+  // meant to be destructive but was registered as a plain write.
+  const DESTRUCTIVE_TOOLS = [
+    "confluence_delete_comment",
+    "confluence_delete_page",
+    "confluence_delete_space",
+    "confluence_purge_from_trash",
+    "confluence_remove_label",
+    "confluence_set_content_property",
+    "jira_delete_attachment",
+    "jira_delete_comment",
+    "jira_delete_component",
+    "jira_delete_filter",
+    "jira_delete_filter_permission",
+    "jira_delete_issue_link",
+    "jira_delete_remote_link",
+    "jira_delete_sprint",
+    "jira_delete_version",
+    "jira_delete_worklog",
+    "jira_set_issue_property",
+  ];
+  const toolNames = new Set(tools.map((tool) => tool.name));
+  const exposedDestructive = DESTRUCTIVE_TOOLS.filter((name) => toolNames.has(name));
+  // Read-only mode outranks the destructive opt-in: ATLASSIAN_READ_ONLY=true and
+  // the `read` profile both withhold every non-read tool regardless of the flag.
+  const readOnly =
+    process.env.ATLASSIAN_READ_ONLY === "true" ||
+    process.env.ATLASSIAN_PROFILE?.trim().toLowerCase() === "read";
+  if (process.env.ATLASSIAN_ALLOW_DESTRUCTIVE === "true" && !readOnly) {
+    const missing = DESTRUCTIVE_TOOLS.filter((name) => !toolNames.has(name));
     check(
-      "delete tools withheld unless ATLASSIAN_ALLOW_DESTRUCTIVE=true",
-      deleteTools.length === 0,
-      deleteTools.map((t) => t.name).join(", "),
+      "destructive tools present when explicitly allowed",
+      missing.length === 0,
+      `missing: ${missing.join(", ")}`,
     );
-  } else if (process.env.ATLASSIAN_ALLOW_DESTRUCTIVE === "true") {
-    check("delete tools present when explicitly allowed", deleteTools.length === 6, `${deleteTools.length}/6`);
+  } else {
+    check(
+      readOnly
+        ? "read-only mode withholds destructive tools even with the opt-in set"
+        : "destructive tools withheld unless ATLASSIAN_ALLOW_DESTRUCTIVE=true",
+      exposedDestructive.length === 0,
+      exposedDestructive.join(", "),
+    );
   }
 
   if (runLiveChecks) {

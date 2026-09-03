@@ -4,11 +4,13 @@
  * (mutating) operations such as creating and updating pages.
  */
 import { Parser } from "htmlparser2";
+import { basename } from "node:path";
 
 import {
     assertAttachmentPathAllowed,
     assertAttachmentSize,
     DEFAULT_MAX_ATTACHMENT_BYTES,
+    readExistingAttachment,
     writeNewAttachment,
 } from "./attachmentSecurity.js";
 import {
@@ -16,7 +18,9 @@ import {
     atlassianGet,
     atlassianGetBinary,
     atlassianPost,
+    atlassianPostFormData,
     atlassianPut,
+    AtlassianHttpError,
 } from "./httpClient.js";
 import { requireUpstreamArray, requireUpstreamObject } from "./upstreamShape.js";
 
@@ -160,6 +164,66 @@ export interface ConfluenceComment {
 export interface DeleteConfluenceCommentResult {
     id: string;
     deleted: boolean;
+}
+
+/** One hit from a global (all-entity-type) CQL search. */
+export interface ConfluenceSearchHit {
+    /** "page", "blogpost", "space", "user", "attachment"… */
+    type: string;
+    id: string;
+    title: string;
+    space: string;
+    url: string;
+    lastModified: string;
+}
+
+export interface ConfluenceGlobalSearchResult extends ConfluencePaginationInfo {
+    results: ConfluenceSearchHit[];
+}
+
+export interface ConfluenceExportedPage {
+    id: string;
+    title: string;
+    space: string;
+    version: number;
+    format: string;
+    /** Rendered HTML, not the lossy plain text `getPage` returns. */
+    html: string;
+    url: string;
+}
+
+export interface ConfluencePageVersionContent {
+    id: string;
+    title: string;
+    space: string;
+    version: number;
+    /** Raw storage-format markup, safe to write straight back. */
+    storage: string;
+    /** Plain-text rendering of the same content, for reading. */
+    body: string;
+}
+
+export interface ConfluenceSpaceDetails {
+    key: string;
+    name: string;
+    type: string;
+    description: string;
+    homepageId: string;
+    homepageTitle: string;
+    url: string;
+}
+
+export interface ConfluenceLabel {
+    name: string;
+    prefix: string;
+    id: string;
+}
+
+export interface ConfluenceRestriction {
+    /** "read" or "update". */
+    operation: string;
+    users: string[];
+    groups: string[];
 }
 /**
  * Converter from Confluence "storage format" (an XHTML dialect) to plain
@@ -924,6 +988,608 @@ export class ConfluenceClient {
             body: storage ? storageToPlainText(storage) : "",
             version: comment.version?.number || 1,
             url: buildPageUrl(this.options.baseUrl, comment._links?.webui),
+        };
+    }
+
+    /**
+     * Searches every entity type Confluence indexes — pages, blog posts,
+     * spaces, users, attachments — rather than content alone.
+     *
+     * `searchPages` uses `/rest/api/content/search`, which by construction can
+     * only ever return content. "Which space is X in" and "who is Y" were
+     * therefore unanswerable, even though CQL expresses both.
+     */
+    async search(cql: string, limit = 20, start = 0): Promise<ConfluenceGlobalSearchResult> {
+        const data = requireResponseObject(await atlassianGet({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: "/rest/api/search",
+            // `excerpt=none` keeps the highlighted-snippet HTML out of the
+            // payload; it is markup noise that no caller here renders.
+            query: { cql, limit, start, excerpt: "none" },
+        }), "global search response");
+        const results: ConfluenceSearchHit[] = requireOptionalArray(data.results, "global search result list")
+            .map((item: any) => ({
+                type: item.content?.type || item.entityType || "unknown",
+                id: item.content?.id || "",
+                title: item.title || item.content?.title || "",
+                space: item.resultGlobalContainer?.title || item.content?.space?.key || "",
+                url: buildPageUrl(this.options.baseUrl, item.url || item.content?._links?.webui),
+                lastModified: item.lastModified || "",
+            }));
+        const total = typeof data.totalSize === "number" ? data.totalSize : start + results.length;
+        const nextStart = start + results.length;
+        const hasMore = results.length > 0 && nextStart < total;
+        return {
+            start,
+            limit,
+            returned: results.length,
+            total,
+            hasMore,
+            nextStart: hasMore ? nextStart : null,
+            results,
+        };
+    }
+
+    /** The chain of parent pages above a page, outermost first. */
+    async getPageAncestors(pageId: string): Promise<ConfluencePageSummary[]> {
+        const page = requireResponseObject(await atlassianGet({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/content/${encodeURIComponent(pageId)}`,
+            query: { expand: "ancestors,space" },
+        }), `ancestor response for page ${pageId}`);
+        return requireOptionalArray(page.ancestors, `ancestor list on page ${pageId}`).map((ancestor: any) => ({
+            id: ancestor.id,
+            title: ancestor.title || "",
+            space: ancestor.space?.key || page.space?.key || "",
+            url: buildPageUrl(this.options.baseUrl, ancestor._links?.webui),
+        }));
+    }
+
+    /**
+     * Every page beneath a page, at any depth.
+     *
+     * Deliberately implemented as a CQL `ancestor = …` search rather than the
+     * `/descendant/page` sub-path: that sub-path is not in the Data Center REST
+     * reference, whereas `ancestor` is a documented CQL field, so this works on
+     * instances where the shortcut does not exist.
+     */
+    async getPageDescendants(pageId: string, limit = 100): Promise<ConfluenceSearchResult> {
+        return this.searchPages(`ancestor = ${JSON.stringify(pageId)} and type = page`, limit);
+    }
+
+    /**
+     * Returns a page rendered for export: fully expanded macros and resolved
+     * links, as HTML. `getPage` returns a lossy plain-text rendering that is
+     * fine for reading and unusable for reproducing the page elsewhere.
+     */
+    async exportPage(pageId: string, format: "export_view" | "styled_view" | "view" = "export_view"): Promise<ConfluenceExportedPage> {
+        const page = requireResponseObject(await atlassianGet({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/content/${encodeURIComponent(pageId)}`,
+            query: { expand: `body.${format},space,version` },
+        }), `export response for page ${pageId}`);
+        return {
+            id: page.id,
+            title: page.title,
+            space: page.space?.key || "",
+            version: page.version?.number ?? 1,
+            format,
+            html: page.body?.[format]?.value || "",
+            url: buildPageUrl(this.options.baseUrl, page._links?.webui),
+        };
+    }
+
+    /**
+     * Reads the storage-format body of a specific historical version, so an
+     * edit can be reviewed or reverted.
+     *
+     * `status=any` is used rather than `status=historical`: only the former is
+     * documented for Data Center, and it selects the requested version just as
+     * well when `version` is given.
+     */
+    async getPageVersion(pageId: string, versionNumber: number): Promise<ConfluencePageVersionContent> {
+        if (!Number.isSafeInteger(versionNumber) || versionNumber <= 0) {
+            throw new Error("versionNumber must be a positive integer.");
+        }
+        const page = requireResponseObject(await atlassianGet({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/content/${encodeURIComponent(pageId)}`,
+            query: { status: "any", version: versionNumber, expand: "body.storage,version,space" },
+        }), `version ${versionNumber} response for page ${pageId}`);
+        const storage = page.body?.storage?.value || "";
+        return {
+            id: page.id || pageId,
+            title: page.title || "",
+            space: page.space?.key || "",
+            version: page.version?.number ?? versionNumber,
+            storage,
+            body: storage ? storageToPlainText(storage) : "(no content)",
+        };
+    }
+
+    /**
+     * Reverts a page to an earlier version by re-publishing that version's
+     * storage body as a new version.
+     *
+     * Confluence Data Center has no native restore-version operation, so this
+     * is read-then-write. It is additive: the intervening versions stay in the
+     * history and the revert itself is another version, which is why it can be
+     * undone the same way.
+     */
+    async restorePageVersion(pageId: string, versionNumber: number): Promise<ConfluenceUpdatedPage> {
+        const historical = await this.getPageVersion(pageId, versionNumber);
+        const current = requireResponseObject(await atlassianGet({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/content/${encodeURIComponent(pageId)}`,
+            query: { expand: "version,space" },
+        }), `current version response for page ${pageId}`);
+        const nextVersion = (current.version?.number ?? 1) + 1;
+        const currentVersion = current.version?.number ?? 1;
+        // Guard against restoring the live version, which would burn a version
+        // and notify every watcher for a no-op change.
+        if (versionNumber >= currentVersion) {
+            throw new Error(
+                `Version ${versionNumber} of page ${pageId} is not older than the current version ` +
+                `${currentVersion}; there is nothing to restore.`,
+            );
+        }
+        const updated = await atlassianPut({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/content/${encodeURIComponent(pageId)}`,
+            body: {
+                id: pageId,
+                type: "page",
+                title: historical.title || current.title,
+                space: current.space ? { key: current.space.key } : undefined,
+                // The historical body is already storage format; passing it
+                // through toStorageValue would re-escape valid markup.
+                body: { storage: { value: historical.storage, representation: "storage" } },
+                version: {
+                    number: nextVersion,
+                    message: `Restored content of version ${versionNumber}`,
+                },
+            },
+        });
+        return {
+            id: updated.id,
+            title: updated.title,
+            url: buildPageUrl(this.options.baseUrl, updated._links?.webui),
+            version: nextVersion,
+        };
+    }
+
+    /**
+     * Re-parents a page. Mutates data: PUT /rest/api/content/{id} with a new
+     * `ancestors` list, which is the documented way to move a page in the tree.
+     * The body is deliberately not sent, so the page content is untouched.
+     */
+    async movePage(pageId: string, newParentId: string): Promise<ConfluenceUpdatedPage> {
+        const current = requireResponseObject(await atlassianGet({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/content/${encodeURIComponent(pageId)}`,
+            query: { expand: "version,space" },
+        }), `move source response for page ${pageId}`);
+        if (pageId === newParentId) {
+            throw new Error("A page cannot be made its own parent.");
+        }
+        const nextVersion = (current.version?.number ?? 1) + 1;
+        const updated = await atlassianPut({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/content/${encodeURIComponent(pageId)}`,
+            body: {
+                id: pageId,
+                type: "page",
+                title: current.title,
+                ancestors: [{ id: newParentId }],
+                version: { number: nextVersion },
+            },
+        });
+        return {
+            id: updated.id,
+            title: updated.title,
+            url: buildPageUrl(this.options.baseUrl, updated._links?.webui),
+            version: nextVersion,
+        };
+    }
+
+    async getSpace(spaceKey: string): Promise<ConfluenceSpaceDetails> {
+        const space = requireResponseObject(await atlassianGet({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/space/${encodeURIComponent(spaceKey)}`,
+            query: { expand: "description.plain,homepage" },
+        }), `space ${spaceKey} response`);
+        return {
+            key: space.key || spaceKey,
+            name: space.name || "",
+            type: space.type || "",
+            description: space.description?.plain?.value || "",
+            homepageId: space.homepage?.id || "",
+            homepageTitle: space.homepage?.title || "",
+            url: buildPageUrl(this.options.baseUrl, space._links?.webui),
+        };
+    }
+
+    /** Every page in a space, so a documentation set can be enumerated. */
+    async listSpaceContent(spaceKey: string, limit = 50): Promise<ConfluenceSearchResult> {
+        // A plain `space = … and type = page` CQL query is the one formulation
+        // that is valid on every Data Center version. The `/space/{key}/content`
+        // sub-resource and CQL predicates such as `ancestor is empty` would be
+        // narrower but are not documented consistently across releases.
+        return this.searchPages(`space = ${JSON.stringify(spaceKey)} and type = page`, limit);
+    }
+
+    /**
+     * Creates a space. Mutates data: POST /rest/api/space, or
+     * /rest/api/space/_private for one visible only to its creator.
+     */
+    async createSpace(options: {
+        key: string;
+        name: string;
+        description?: string;
+        isPrivate?: boolean;
+    }): Promise<ConfluenceSpaceDetails> {
+        const created = await atlassianPost({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: options.isPrivate ? "/rest/api/space/_private" : "/rest/api/space",
+            body: {
+                key: options.key,
+                name: options.name,
+                description: options.description
+                    ? { plain: { value: options.description, representation: "plain" } }
+                    : undefined,
+            },
+        });
+        return {
+            key: created?.key || options.key,
+            name: created?.name || options.name,
+            type: created?.type || "",
+            description: created?.description?.plain?.value || options.description || "",
+            homepageId: created?.homepage?.id || "",
+            homepageTitle: created?.homepage?.title || "",
+            url: buildPageUrl(this.options.baseUrl, created?._links?.webui),
+        };
+    }
+
+    async updateSpace(spaceKey: string, options: { name?: string; description?: string }): Promise<ConfluenceSpaceDetails> {
+        const current = await this.getSpace(spaceKey);
+        await atlassianPut({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/space/${encodeURIComponent(spaceKey)}`,
+            body: {
+                key: spaceKey,
+                name: options.name ?? current.name,
+                description: {
+                    plain: {
+                        value: options.description ?? current.description,
+                        representation: "plain",
+                    },
+                },
+            },
+        });
+        return this.getSpace(spaceKey);
+    }
+
+    /**
+     * Deletes a space. Confluence answers 202 and runs the deletion as a
+     * long-running task, so success here means "accepted", not "finished" —
+     * and unlike a page, a deleted space does not land in a recoverable trash.
+     */
+    async deleteSpace(spaceKey: string): Promise<{ key: string; accepted: true; note: string }> {
+        await atlassianDelete({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/space/${encodeURIComponent(spaceKey)}`,
+        });
+        return {
+            key: spaceKey,
+            accepted: true,
+            note: "Confluence accepted the deletion and runs it as a background task; " +
+                "the space and all its content disappear once that task completes.",
+        };
+    }
+
+    async listLabels(pageId: string): Promise<ConfluenceLabel[]> {
+        const response = requireResponseObject(await atlassianGet({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/content/${encodeURIComponent(pageId)}/label`,
+        }), `label list response for page ${pageId}`);
+        return requireOptionalArray(response.results, `label list on page ${pageId}`).map((label: any) => ({
+            name: label?.name || "",
+            prefix: label?.prefix || "global",
+            id: String(label?.id ?? ""),
+        }));
+    }
+
+    /** Adds labels to a page. Additive: existing labels are kept. */
+    async addLabels(pageId: string, labels: string[]): Promise<ConfluenceLabel[]> {
+        if (labels.length === 0) {
+            throw new Error("At least one label is required.");
+        }
+        const response = requireResponseObject(await atlassianPost({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/content/${encodeURIComponent(pageId)}/label`,
+            body: labels.map((name) => ({ prefix: "global", name })),
+        }), `label creation response for page ${pageId}`);
+        return requireOptionalArray(response.results, `label list on page ${pageId}`).map((label: any) => ({
+            name: label?.name || "",
+            prefix: label?.prefix || "global",
+            id: String(label?.id ?? ""),
+        }));
+    }
+
+    async removeLabel(pageId: string, label: string): Promise<{ pageId: string; label: string; removed: true }> {
+        await atlassianDelete({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/content/${encodeURIComponent(pageId)}/label`,
+            query: { name: label },
+        });
+        return { pageId, label, removed: true };
+    }
+
+    /**
+     * Reads a page's view/edit restrictions.
+     *
+     * Read-only on purpose: Confluence Data Center's REST reference documents
+     * only the `byOperation` read endpoints, with no supported way to add or
+     * remove a restriction. Guessing at a write path here would be guessing at
+     * an access-control API, which is exactly the wrong place to guess.
+     */
+    async getRestrictions(pageId: string): Promise<ConfluenceRestriction[]> {
+        const response = requireResponseObject(await atlassianGet({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/content/${encodeURIComponent(pageId)}/restriction/byOperation`,
+            query: {
+                expand: "read.restrictions.user,read.restrictions.group," +
+                    "update.restrictions.user,update.restrictions.group",
+            },
+        }), `restriction response for page ${pageId}`);
+        return Object.entries(response)
+            // The map is keyed by operation; `_links`/`_expandable` ride along.
+            .filter(([key]) => !key.startsWith("_"))
+            .map(([operation, restriction]: [string, any]) => ({
+                operation,
+                users: requireOptionalArray(restriction?.restrictions?.user?.results, "restricted user list")
+                    .map((user: any) => user?.username || user?.displayName || "")
+                    .filter((name: string) => name !== ""),
+                groups: requireOptionalArray(restriction?.restrictions?.group?.results, "restricted group list")
+                    .map((group: any) => group?.name || "")
+                    .filter((name: string) => name !== ""),
+            }))
+            // An operation with no users and no groups is unrestricted, which is
+            // the default state and not worth reporting.
+            .filter((restriction) => restriction.users.length > 0 || restriction.groups.length > 0);
+    }
+
+    async listContentProperties(pageId: string): Promise<{ key: string; version: number }[]> {
+        const response = requireResponseObject(await atlassianGet({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/content/${encodeURIComponent(pageId)}/property`,
+            query: { expand: "version" },
+        }), `property list response for page ${pageId}`);
+        return requireOptionalArray(response.results, `property list on page ${pageId}`).map((property: any) => ({
+            key: property?.key || "",
+            version: property?.version?.number ?? 1,
+        }));
+    }
+
+    async getContentProperty(pageId: string, propertyKey: string): Promise<{ key: string; value: unknown; version: number }> {
+        const property = requireResponseObject(await atlassianGet({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/content/${encodeURIComponent(pageId)}/property/${encodeURIComponent(propertyKey)}`,
+        }), `property "${propertyKey}" response for page ${pageId}`);
+        return {
+            key: property.key || propertyKey,
+            value: property.value,
+            version: property.version?.number ?? 1,
+        };
+    }
+
+    /**
+     * Writes a content property, creating it or bumping its version.
+     *
+     * Content properties are app storage, so overwriting one can corrupt an
+     * installed app's state — hence the destructive classification on the tool
+     * that exposes this.
+     */
+    async setContentProperty(pageId: string, propertyKey: string, value: unknown): Promise<{ key: string; version: number }> {
+        let nextVersion = 1;
+        let exists = false;
+        try {
+            const existing = await this.getContentProperty(pageId, propertyKey);
+            nextVersion = existing.version + 1;
+            exists = true;
+        } catch (error) {
+            // A missing property is the create case; anything else is a real
+            // failure and must not be swallowed into a blind create.
+            if (!(error instanceof AtlassianHttpError) || error.status !== 404) throw error;
+        }
+        if (exists) {
+            await atlassianPut({
+                baseUrl: this.options.baseUrl,
+                pat: this.options.pat,
+                path: `/rest/api/content/${encodeURIComponent(pageId)}/property/${encodeURIComponent(propertyKey)}`,
+                body: { key: propertyKey, value, version: { number: nextVersion } },
+            });
+        } else {
+            await atlassianPost({
+                baseUrl: this.options.baseUrl,
+                pat: this.options.pat,
+                path: `/rest/api/content/${encodeURIComponent(pageId)}/property`,
+                body: { key: propertyKey, value },
+            });
+        }
+        return { key: propertyKey, version: nextVersion };
+    }
+
+    /** Whether the PAT's owner is watching the page. */
+    async isWatchingPage(pageId: string): Promise<{ pageId: string; watching: boolean }> {
+        const response = requireResponseObject(await atlassianGet({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/user/watch/content/${encodeURIComponent(pageId)}`,
+        }), `watch state response for page ${pageId}`);
+        return { pageId, watching: response.watching === true };
+    }
+
+    /**
+     * Starts or stops watching a page as the PAT's owner.
+     *
+     * Only the caller's own subscription can be changed here. Confluence Data
+     * Center publishes no endpoint that lists a page's watchers, so "who else
+     * is watching this" is deliberately not offered rather than approximated.
+     */
+    async setPageWatch(pageId: string, watching: boolean): Promise<{ pageId: string; watching: boolean }> {
+        const request = watching ? atlassianPost : atlassianDelete;
+        await request({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/user/watch/content/${encodeURIComponent(pageId)}`,
+        });
+        return { pageId, watching };
+    }
+
+    /**
+     * Pages sitting in a space's trash: deleted, but still restorable.
+     *
+     * Uses the content list endpoint's documented `status` parameter rather
+     * than a CQL predicate — CQL has no status field, so a query written that
+     * way would silently return live pages instead of trashed ones.
+     */
+    async listTrashedPages(spaceKey: string, limit = 50): Promise<ConfluencePageSummary[]> {
+        const response = requireResponseObject(await atlassianGet({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: "/rest/api/content",
+            query: { spaceKey, type: "page", status: "trashed", limit, expand: "space" },
+        }), `trash listing response for space ${spaceKey}`);
+        return requireOptionalArray(response.results, `trash listing for space ${spaceKey}`)
+            .map((page: any) => ({
+                id: page.id,
+                title: page.title || "",
+                space: page.space?.key || spaceKey,
+                url: buildPageUrl(this.options.baseUrl, page._links?.webui),
+            }));
+    }
+
+    /**
+     * Restores a trashed page. Confluence's documented mechanism is a normal
+     * content update that sets `status` back to `current` with an incremented
+     * version and changes nothing else.
+     */
+    async restoreFromTrash(pageId: string): Promise<{ id: string; restored: true; version: number }> {
+        const current = requireResponseObject(await atlassianGet({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/content/${encodeURIComponent(pageId)}`,
+            query: { status: "trashed", expand: "version" },
+        }), `trashed page ${pageId} response`);
+        const nextVersion = (current.version?.number ?? 1) + 1;
+        await atlassianPut({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/content/${encodeURIComponent(pageId)}`,
+            body: { id: pageId, status: "current", version: { number: nextVersion } },
+        });
+        return { id: pageId, restored: true, version: nextVersion };
+    }
+
+    /** Permanently purges an already-trashed page. There is no recovery from this. */
+    async purgeFromTrash(pageId: string): Promise<ConfluenceDeleteResult> {
+        await atlassianDelete({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/content/${encodeURIComponent(pageId)}`,
+            query: { status: "trashed" },
+        });
+        return { id: pageId, deleted: true };
+    }
+
+    /**
+     * Uploads a local file as a page attachment. Mutates data: POST
+     * /rest/api/content/{id}/child/attachment.
+     *
+     * The path goes through the same allowlist as every other filesystem read
+     * in this server: page content is authored by other people, so a crafted
+     * page must not be able to talk an agent into uploading an arbitrary local
+     * file to a space that other people can read.
+     */
+    async uploadAttachment(pageId: string, filePath: string, options: {
+        mimeType?: string;
+        comment?: string;
+        minorEdit?: boolean;
+    } = {}): Promise<ConfluenceAttachment[]> {
+        const { path: safeFilePath, data } = await readExistingAttachment(this.options, filePath);
+        const mimeType = options.mimeType || "application/octet-stream";
+        const form = new FormData();
+        form.append("file", new Blob([data], { type: mimeType }), basename(safeFilePath));
+        if (options.comment) form.append("comment", options.comment);
+        form.append("minorEdit", options.minorEdit === false ? "false" : "true");
+        const response = requireResponseObject(await atlassianPostFormData({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/content/${encodeURIComponent(pageId)}/child/attachment`,
+            body: form,
+        }), `attachment upload response for page ${pageId}`);
+        return requireOptionalArray(response.results, `uploaded attachment list for page ${pageId}`)
+            .map((attachment: any) => ({
+                id: attachment.id,
+                title: attachment.title || basename(safeFilePath),
+                mediaType: attachment.metadata?.mediaType || mimeType,
+                fileSize: attachment.extensions?.fileSize ?? data.byteLength,
+                author: attachment.version?.by?.displayName || attachment.version?.by?.username || "Unknown",
+                created: attachment.version?.when || "",
+                downloadPath: attachment._links?.download || "",
+            }));
+    }
+
+    /**
+     * Replaces an existing attachment's binary content with a new version.
+     * The attachment ID, its links and its comment thread survive; only the
+     * bytes change, which is what "upload a corrected file" actually means.
+     */
+    async updateAttachmentData(pageId: string, attachmentId: string, filePath: string, options: {
+        mimeType?: string;
+        comment?: string;
+        minorEdit?: boolean;
+    } = {}): Promise<ConfluenceAttachment> {
+        const { path: safeFilePath, data } = await readExistingAttachment(this.options, filePath);
+        const mimeType = options.mimeType || "application/octet-stream";
+        const form = new FormData();
+        form.append("file", new Blob([data], { type: mimeType }), basename(safeFilePath));
+        if (options.comment) form.append("comment", options.comment);
+        form.append("minorEdit", options.minorEdit === false ? "false" : "true");
+        const updated = requireResponseObject(await atlassianPostFormData({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/content/${encodeURIComponent(pageId)}` +
+                `/child/attachment/${encodeURIComponent(attachmentId)}/data`,
+            body: form,
+        }), `attachment update response for ${attachmentId} on page ${pageId}`);
+        return {
+            id: updated.id || attachmentId,
+            title: updated.title || basename(safeFilePath),
+            mediaType: updated.metadata?.mediaType || mimeType,
+            fileSize: updated.extensions?.fileSize ?? data.byteLength,
+            author: updated.version?.by?.displayName || updated.version?.by?.username || "Unknown",
+            created: updated.version?.when || "",
+            downloadPath: updated._links?.download || "",
         };
     }
 }

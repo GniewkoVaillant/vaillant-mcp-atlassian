@@ -1,7 +1,12 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
+import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+
+// `URL.pathname` yields "/C:/…" on Windows, which node cannot execute, so this
+// suite failed to boot the server there while passing everywhere else.
+const SERVER_ENTRYPOINT = fileURLToPath(new URL("../index.js", import.meta.url));
 
 type ListedTool = Awaited<ReturnType<Client["listTools"]>>["tools"][number];
 
@@ -24,7 +29,7 @@ async function withServer(
   };
   const transport = new StdioClientTransport({
     command: process.execPath,
-    args: [new URL("../index.js", import.meta.url).pathname],
+    args: [SERVER_ENTRYPOINT],
     env,
     stderr: "pipe",
   });

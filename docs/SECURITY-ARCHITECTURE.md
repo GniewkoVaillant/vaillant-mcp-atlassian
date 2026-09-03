@@ -28,12 +28,18 @@ Sensitive boundaries:
 
 ### Tool exposure and mutation policy
 
-`ATLASSIAN_ALLOW_DESTRUCTIVE=false` is the default. Delete tools are not
-registered, so no model prompt can invoke them. Explicitly enabling destructive
-tools is an operator decision and should be limited to a dedicated maintenance
-process. `ATLASSIAN_READ_ONLY=true` removes all non-read tools. The named `read`
-profile always enforces the same rule, including mutation tools belonging to a
-nominally mixed group such as `links`.
+`ATLASSIAN_ALLOW_DESTRUCTIVE=false` is the default. Tools registered as
+destructive are not registered at all, so no model prompt can invoke them.
+The gate covers every deletion plus three writes that are destructive without
+being deletions: `jira_set_issue_property` and `confluence_set_content_property`
+overwrite storage belonging to installed apps (ProForma's form data lives in
+Jira issue properties) with no version history and no undo, and
+`confluence_purge_from_trash` is the step that makes a page deletion
+irrecoverable. Explicitly enabling destructive tools is an operator decision and
+should be limited to a dedicated maintenance process. `ATLASSIAN_READ_ONLY=true`
+removes all non-read tools. The named `read` profile always enforces the same
+rule, including mutation tools belonging to a nominally mixed group such as
+`links`, `meta` or `filters`.
 
 MCP `readOnlyHint`, `destructiveHint` and related annotations are informational;
 they do not replace registration-time enforcement. Non-destructive create,
@@ -41,10 +47,58 @@ update, assignment, transition and comment tools remain available in writable
 profiles, so least-privilege PATs and explicit read-only deployments still
 matter.
 
+Three write capabilities deserve separate operator attention because their blast
+radius extends past the object being written:
+
+- `jira_add_filter_permission` can share a saved filter with every logged-in
+  user (`authenticated`) or everyone who can reach the instance (`global`). That
+  discloses the query *and* the issues it returns. Filters created through
+  `jira_create_filter` are always private; widening is a separate explicit call,
+  and this server never grants edit rights on a shared filter.
+- `jira_notify_issue` and `jsm_add_request_comment` leave Atlassian: the first
+  sends email that cannot be recalled and leaves no record on the issue, the
+  second reaches a customer's inbox when `isPublic` is true. `isPublic` is a
+  required parameter with no default, so the visibility decision is always made
+  explicitly rather than inherited.
+- `confluence_create_space` and `confluence_delete_space` operate at
+  organisation level. Space deletion is effectively irreversible — unlike a
+  page, a deleted space does not land in a recoverable trash — and Confluence
+  runs it as a background task, so the tool's success means "accepted", not
+  "completed".
+
 Explicit destructive opt-in does not verify human approval. A future approval
 mechanism must independently bind one authenticated actor to one exact action,
 one exact target, a short expiry and one-time use; an LLM-supplied confirmation
 boolean cannot provide that guarantee.
+
+### Capabilities deliberately not implemented
+
+Absence here is a decision, recorded so a later contributor does not "fix" it by
+guessing:
+
+- **Confluence content-restriction writes.** The Data Center REST reference
+  documents only the `byOperation` read endpoints. No supported write path
+  exists, and an access-control API is the last place to infer one from a Cloud
+  document. Restrictions are exposed read-only.
+- **Confluence space permissions.** No REST resource on Data Center; the
+  historical alternative is the deprecated JSON-RPC API.
+- **Jira user provisioning.** `POST`/`DELETE /rest/api/2/user` exist and are
+  deliberately not exposed. Identity provisioning has its own approval and audit
+  path and must not sit behind a prompt.
+- **Marketplace app APIs other than `vaillant-timetracking`.** In particular
+  "Rich Filters for Jira Dashboards" (`com.qotilabs.jira.rich-filters-plugin`,
+  Appfire) publishes no public REST API. Any base path would be an unsupported
+  internal namespace discovered by guessing.
+
+### Payload minimisation as a control
+
+Directory reads are capped server-side at 50 results
+(`jiraDirectoryClient.ts`), and `createmeta` field options at 50 per field
+(`jiraMetaClient.ts`), regardless of what the caller requests. This is
+data minimisation, not only token economy: an unbounded `jira_search_users` call
+is a convenient way to pull a company's staff directory — names and email
+addresses — into a model's context and, from there, into whatever the client
+retains.
 
 ### Credential, transport and log hygiene
 
@@ -53,6 +107,11 @@ development tests. Base URLs containing embedded credentials, query strings or
 fragments are rejected. HTTP helpers refuse credential delivery to an origin
 other than the configured upstream origin. A Unix `.env` readable by other users
 is rejected; keep it mode `0600` and outside version control.
+
+Callers may supply extra request headers — Jira Service Management's
+`X-ExperimentalApi` opt-in needs one — but the HTTP layer merges them *before*
+the authentication and `Accept` headers, so a caller-supplied `Authorization`
+loses to the configured one and cannot silently substitute a different identity.
 
 Startup diagnostics contain operational settings but never PAT values. MCP tool
 events contain a request correlation ID, tool name, operation kind, outcome and
@@ -68,11 +127,19 @@ waits only within `ATLASSIAN_MAX_QUEUED_REQUESTS` and otherwise fails closed.
 Retryable upstream rate limits and transient failures use bounded backoff.
 Potentially non-idempotent writes must not be replayed after ambiguous network
 failures. `ATLASSIAN_MAX_PAGINATION_PAGES` caps every automatic pagination walk: the
-Jira Agile paths (boards, sprints, sprint issues), the Jira changelog walk
+Jira Agile paths (boards, sprints, sprint issues, backlog, board issues, epics),
+the Jira changelog walk
 (`jira_get_issue_changelog`, `jira_get_issue_cycle_time`) and the Confluence
 ones (`confluence_list_spaces`, `confluence_get_page_children`,
 `confluence_list_comments`); repeated, stalled and malformed pagination is
 rejected instead of returning partial results as complete.
+
+Collections that are not auto-paginated are hard-capped instead, so no single
+call can return an unbounded list: 50 results for user, group, filter and
+service-desk reads, 50 issues per Agile move or rank request, 50 rows per
+`jira_bulk_create_issues` call, and 50 allowed values per field in
+`jira_get_create_meta`. Batch limits are enforced client-side with a message
+naming the limit, rather than relayed as an upstream 400.
 
 ProForma chunk fetching is bounded at both levels, not only the inner one. A
 single form decodes at most `MAX_PROFORMA_CHUNKS` (25) chunks, fetched
@@ -94,7 +161,10 @@ Attachment upload/download is disabled until `ATLASSIAN_ATTACHMENT_DIRS`
 contains explicit, absolute, non-root directories. Existing paths are
 canonicalized so symlinks cannot escape approved directories. Download targets
 must not overwrite existing files or traverse symlink destinations.
-`ATLASSIAN_MAX_ATTACHMENT_BYTES` limits accepted attachment sizes.
+`ATLASSIAN_MAX_ATTACHMENT_BYTES` limits accepted attachment sizes. Confluence
+uploads (`confluence_upload_attachment`, `confluence_update_attachment_data`)
+route through the same `attachmentSecurity` helpers as the Jira ones; there is
+still exactly one place in the codebase that opens a local file.
 
 Canonicalization addresses symlinks; it does not address hard links, because a
 hard link is a second name for the same inode and `realpath()` returns the
@@ -193,7 +263,15 @@ automatically convert an Entra token into a Jira or Confluence Data Center PAT.
 ## Residual risks and implementation boundaries
 
 - A writable local profile can still create or modify data; accidental deletion
-  prevention does not make it read-only.
+  prevention does not make it read-only. The writable surface is now
+  substantially larger — saved filters and their sharing, sprints and backlog
+  order, Confluence spaces, labels and page hierarchy, and Jira Service
+  Management approvals are all reachable — so the least-privilege PAT matters
+  more than it did, not less. A PAT without project-admin rights cannot delete a
+  version or close someone else's sprint no matter what a prompt asks for.
+- `jira_get_my_permissions` reports what a token can do, but it is a diagnostic
+  for the agent, not an enforcement point. Upstream Atlassian permission checks
+  remain the only real authorization boundary.
 - PATs in a protected `.env` remain plaintext at rest and inherit every
   permission granted to their owners.
 - Bounded downloads and bounded JSON responses are assembled in memory rather
@@ -229,7 +307,19 @@ automatically convert an Entra token into a Jira or Confluence Data Center PAT.
 Run `npm run build`, `npm run test:unit`, and the stdio smoke test. Unit tests
 cover synthetic HTTP retry/timeout behavior, queue/concurrency budgets, URL and
 configuration validation, attachment traversal/symlink/size protections,
-pagination safety and MCP tool exposure. Never place real PATs in fixtures.
+pagination safety, MCP tool exposure, and the version-dependent Data Center
+fallbacks (`createmeta`, filter search, filter favourites). Never place real
+PATs in fixtures.
+
+A few filesystem-safety tests need primitives Windows does not always provide —
+creating a symlink requires Developer Mode or elevation, and NTFS has no POSIX
+mode bits. Those tests are gated on a runtime capability probe
+(`SKIP_WITHOUT_SYMLINKS`, `SKIP_WITHOUT_POSIX_MODES` in
+`src/__tests__/testServer.ts`) rather than weakened, so they run in full on CI
+and on any developer machine that supports them. Five remaining tests (FIFO,
+unix domain socket and character-device refusal, colon-delimited path parsing)
+are POSIX-only by nature and still fail on Windows; treat a Windows run as a
+partial gate and Linux/CI as the authoritative one.
 
 Ordinary `npm run test:smoke` and `npm test` never contact upstream products.
 Run `ATLASSIAN_SMOKE_LIVE=true npm run test:smoke` only after explicitly

@@ -13,6 +13,16 @@ import {
   writeNewAttachment,
   type AttachmentPolicy,
 } from "../attachmentSecurity.js";
+import { SKIP_WITHOUT_POSIX_MODES, SKIP_WITHOUT_SYMLINKS } from "./testServer.js";
+
+/**
+ * Interpolating a filesystem path into a RegExp needs escaping: a Windows path
+ * is full of backslashes, so `C:\Users\...` silently becomes the escapes `\U`
+ * and `\A` and the assertion fails against a message that is in fact correct.
+ */
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 /**
  * One shared suite for the filesystem-safety helpers both clients delegate to.
@@ -67,11 +77,11 @@ describe("assertAttachmentPathAllowed", () => {
 
     await assert.rejects(
       assertAttachmentPathAllowed({ attachmentDirs: [allowed] }, join(outside, "file.txt"), "outputPath"),
-      new RegExp(`is outside the allowed directories \\(${allowed}\\)\\.$`),
+      new RegExp(`is outside the allowed directories \\(${escapeRegExp(allowed)}\\)\\.$`),
     );
   });
 
-  test("rejects traversal through a directory symlink that escapes the allowlist", async () => {
+  test("rejects traversal through a directory symlink that escapes the allowlist", { skip: SKIP_WITHOUT_SYMLINKS }, async () => {
     const allowed = join(directory, "allowed");
     const outside = join(directory, "outside");
     await mkdir(allowed);
@@ -84,7 +94,7 @@ describe("assertAttachmentPathAllowed", () => {
     );
   });
 
-  test("rejects a symbolic-link destination", async () => {
+  test("rejects a symbolic-link destination", { skip: SKIP_WITHOUT_SYMLINKS }, async () => {
     const existing = join(directory, "existing.txt");
     const link = join(directory, "link.txt");
     await writeFile(existing, "preserve this fixture");
@@ -102,7 +112,7 @@ describe("assertAttachmentPathAllowed", () => {
 
     await assert.rejects(
       assertAttachmentPathAllowed(policy(), existing, "outputPath"),
-      new RegExp(`^Error: Attachment outputPath "${existing}" already exists; refusing to overwrite it\\.$`),
+      new RegExp(`^Error: Attachment outputPath "${escapeRegExp(existing)}" already exists; refusing to overwrite it\\.$`),
     );
     assert.equal(await readFile(existing, "utf8"), "preserve this fixture");
   });
@@ -114,7 +124,7 @@ describe("assertAttachmentPathAllowed", () => {
     await assert.rejects(stat(join(directory, "nested")), { code: "ENOENT" });
   });
 
-  test("canonicalizes an allowlisted symlinked parent instead of rejecting it", async () => {
+  test("canonicalizes an allowlisted symlinked parent instead of rejecting it", { skip: SKIP_WITHOUT_SYMLINKS }, async () => {
     const real = join(directory, "real");
     const link = join(directory, "link");
     await mkdir(real);
@@ -137,7 +147,7 @@ describe("assertAttachmentPathAllowed", () => {
     });
   });
 
-  test("with mustExist still enforces the allowlist for an existing file", async () => {
+  test("with mustExist still enforces the allowlist for an existing file", { skip: SKIP_WITHOUT_SYMLINKS }, async () => {
     const allowed = join(directory, "allowed");
     const outside = join(directory, "outside");
     await mkdir(allowed);
@@ -187,8 +197,10 @@ describe("writeNewAttachment", () => {
     await writeNewAttachment(policy(), outputPath, new TextEncoder().encode("safe"));
 
     assert.equal(await readFile(outputPath, "utf8"), "safe");
-    assert.equal((await stat(outputPath)).mode & 0o777, 0o600);
-    assert.equal((await stat(nested)).mode & 0o777, 0o700);
+    if (!SKIP_WITHOUT_POSIX_MODES) {
+      assert.equal((await stat(outputPath)).mode & 0o777, 0o600);
+      assert.equal((await stat(nested)).mode & 0o777, 0o700);
+    }
   });
 
   test("refuses to overwrite a file created between validation and open", async () => {
@@ -230,7 +242,7 @@ describe("writeNewAttachment", () => {
     await assert.rejects(stat(escapeRoot), { code: "ENOENT" });
   });
 
-  test("refuses to write when canonicalization moved the destination", async () => {
+  test("refuses to write when canonicalization moved the destination", { skip: SKIP_WITHOUT_SYMLINKS }, async () => {
     const real = join(directory, "real");
     const link = join(directory, "link");
     await mkdir(real);
@@ -270,7 +282,7 @@ describe("readExistingAttachment", () => {
     await assert.rejects(readExistingAttachment(policy(), join(directory, "missing.txt")), { code: "ENOENT" });
   });
 
-  test("rejects a symlink resolving outside the allowlist", async () => {
+  test("rejects a symlink resolving outside the allowlist", { skip: SKIP_WITHOUT_SYMLINKS }, async () => {
     const allowed = join(directory, "allowed");
     const outside = join(directory, "outside");
     await mkdir(allowed);

@@ -18,56 +18,28 @@ import { z } from "zod";
 import { loadConfig, type ToolGroup } from "./config.js";
 import { JiraClient } from "./jiraClient.js";
 import { JiraAgileClient } from "./jiraAgileClient.js";
+import { JiraDirectoryClient } from "./jiraDirectoryClient.js";
+import { JiraFilterClient } from "./jiraFilterClient.js";
+import { JiraMetaClient } from "./jiraMetaClient.js";
+import { JiraServiceDeskClient } from "./jiraServiceDeskClient.js";
 import { ConfluenceClient } from "./confluenceClient.js";
-import { AtlassianHttpError, configureHttp } from "./httpClient.js";
-/** Formats any thrown error into a concise, user-facing message string. */
-function formatError(error: unknown): string {
-    if (error instanceof AtlassianHttpError) {
-        return error.message;
-    }
-    if (error instanceof Error) {
-        return error.message;
-    }
-    return String(error);
-}
-/**
- * How a tool affects the world, used to derive MCP annotations:
- *  - "read"        never modifies anything
- *  - "write"       creates or updates, and is reversible
- *  - "destructive" removes data or is otherwise hard to undo
- * "local" additionally marks tools that touch the local filesystem rather
- * than (or as well as) the remote Atlassian instance.
- */
-type ToolKind = "read" | "write" | "destructive" | "local";
-
-/**
- * Shared parameter schemas. Without them the model can spend a full round trip
- * on an argument that could never work — `jira_get_issue({issueKey: "https://
- * jira/browse/ABC-123"})` used to validate, reach Jira and come back 404.
- * These are token-cost guards, not a security boundary: every interpolation
- * into a REST path is already encodeURIComponent-escaped.
- */
-const issueKeySchema = z
-    .string()
-    .max(255)
-    .regex(
-        /^[A-Za-z][A-Za-z0-9_]*-[1-9][0-9]*$/,
-        "Must be a bare Jira issue key such as 'ABC-123' — not a URL, summary or ID",
-    );
-/** Confluence content IDs (pages, comments, attachments) are decimal integers. */
-const numericIdSchema = z
-    .string()
-    .max(32)
-    .regex(/^[1-9][0-9]*$/, "Must be a numeric Atlassian content ID such as '601156620'");
-/** Free-text bodies: generous, but not "the model pastes 10 MB" generous. */
-const MAX_TEXT_FIELD_CHARS = 100_000;
-const MAX_TITLE_CHARS = 255;
-const textFieldSchema = z
-    .string()
-    .max(MAX_TEXT_FIELD_CHARS, `Must be at most ${MAX_TEXT_FIELD_CHARS} characters`);
-const titleFieldSchema = z
-    .string()
-    .max(MAX_TITLE_CHARS, `Must be at most ${MAX_TITLE_CHARS} characters`);
+import { configureHttp } from "./httpClient.js";
+import { registerConfluenceExtraTools } from "./tools/confluenceExtraTools.js";
+import { registerJiraAgileWriteTools } from "./tools/jiraAgileWriteTools.js";
+import { registerJiraDirectoryTools } from "./tools/jiraDirectoryTools.js";
+import { registerJiraFilterTools } from "./tools/jiraFilterTools.js";
+import { registerJiraIssueExtraTools } from "./tools/jiraIssueExtraTools.js";
+import { registerJiraMetaTools } from "./tools/jiraMetaTools.js";
+import { registerJiraServiceDeskTools } from "./tools/jiraServiceDeskTools.js";
+import {
+    formatError,
+    issueKeySchema,
+    numericIdSchema,
+    textFieldSchema,
+    titleFieldSchema,
+    type ToolKind,
+    type ToolRegistrar,
+} from "./tools/shared.js";
 
 /**
  * Caps a tool result so a single call cannot swallow the model's context. A
@@ -110,6 +82,22 @@ async function main() {
         baseUrl: config.jiraBaseUrl,
         pat: config.jiraPat,
         maxPaginationPages: config.maxPaginationPages,
+    });
+    const jiraMetaClient = new JiraMetaClient({
+        baseUrl: config.jiraBaseUrl,
+        pat: config.jiraPat,
+    });
+    const jiraDirectoryClient = new JiraDirectoryClient({
+        baseUrl: config.jiraBaseUrl,
+        pat: config.jiraPat,
+    });
+    const jiraFilterClient = new JiraFilterClient({
+        baseUrl: config.jiraBaseUrl,
+        pat: config.jiraPat,
+    });
+    const jiraServiceDeskClient = new JiraServiceDeskClient({
+        baseUrl: config.jiraBaseUrl,
+        pat: config.jiraPat,
     });
     const confluenceClient = new ConfluenceClient({
         baseUrl: config.confluenceBaseUrl,
@@ -239,6 +227,16 @@ async function main() {
         );
         registered.push(name);
     }
+    // Feature areas beyond the original tool set register themselves, so the
+    // policy decision above stays in one place while this file stays readable.
+    const registerTool = tool as ToolRegistrar;
+    registerJiraMetaTools(registerTool, jiraMetaClient);
+    registerJiraDirectoryTools(registerTool, jiraDirectoryClient);
+    registerJiraFilterTools(registerTool, jiraFilterClient);
+    registerJiraIssueExtraTools(registerTool, jiraClient);
+    registerJiraAgileWriteTools(registerTool, jiraAgileClient);
+    registerJiraServiceDeskTools(registerTool, jiraServiceDeskClient);
+    registerConfluenceExtraTools(registerTool, confluenceClient);
     tool("core", "read", "jira_list_projects", {
         title: "List Jira projects",
         description: "List the Jira Data Center projects visible to the current user, with key, name, type " +

@@ -323,6 +323,52 @@ export interface JiraWatcherResult {
     watching: boolean;
 }
 
+/** One row of a bulk create request; `fields` covers anything not named here. */
+export interface JiraBulkCreateInput extends JiraCreateIssueOptions {
+    labels?: string[];
+    fields?: Record<string, any>;
+}
+
+export interface JiraBulkCreateResult {
+    requested: number;
+    created: JiraCreateIssueResult[];
+    /** Rows Jira rejected, by their index in the submitted array. */
+    failed: { index: number; message: string }[];
+}
+
+export interface JiraRemoteLink {
+    id: string;
+    globalId: string;
+    title: string;
+    url: string;
+    relationship: string;
+    applicationName: string;
+}
+
+export interface JiraNotifyResult {
+    issueKey: string;
+    notified: boolean;
+    recipients: string[];
+}
+
+export interface JiraVoteSummary {
+    issueKey: string;
+    votes: number;
+    hasVoted: boolean;
+    voters: string[];
+}
+
+export interface JiraVoteResult {
+    issueKey: string;
+    voted: boolean;
+}
+
+export interface JiraIssuePropertyResult {
+    issueKey: string;
+    propertyKey: string;
+    stored: boolean;
+}
+
 export interface JiraAddWorklogWithCategoryOptions {
     timeSpent: string;
     category: string;
@@ -1663,4 +1709,246 @@ export class JiraClient {
             }
         });
     }
+    /**
+     * Creates several issues in one request. Mutates data: POST
+     * /rest/api/2/issue/bulk.
+     *
+     * Jira answers 201 even when some rows failed, listing the failures
+     * separately, so partial success is the normal case rather than an edge
+     * one. Both halves are reported: silently returning only the created keys
+     * would let a caller conclude a batch succeeded when half of it did not.
+     */
+    async bulkCreateIssues(issues: JiraBulkCreateInput[]): Promise<JiraBulkCreateResult> {
+        if (issues.length === 0) {
+            throw new Error("At least one issue is required.");
+        }
+        if (issues.length > MAX_BULK_ISSUES) {
+            throw new Error(
+                `Bulk create accepts at most ${MAX_BULK_ISSUES} issues per request; ` +
+                `${issues.length} were supplied. Split the batch and repeat the call.`,
+            );
+        }
+        const response = requireResponseObject(await atlassianPost({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: "/rest/api/2/issue/bulk",
+            body: {
+                issueUpdates: issues.map((issue) => {
+                    const fields: Record<string, any> = {
+                        ...(issue.fields || {}),
+                        project: { key: issue.projectKey },
+                        issuetype: { name: issue.issueType },
+                        summary: issue.summary,
+                    };
+                    if (issue.description !== undefined) fields.description = issue.description;
+                    if (issue.parentKey) fields.parent = { key: issue.parentKey };
+                    if (issue.assignee) fields.assignee = { name: issue.assignee };
+                    if (issue.priority) fields.priority = { name: issue.priority };
+                    if (issue.labels) fields.labels = issue.labels;
+                    return { fields };
+                }),
+            },
+        }), "bulk create response");
+        const created = requireOptionalArray(response.issues, "bulk create issue list").map((issue: any) => ({
+            key: issue?.key || "",
+            id: issue?.id || "",
+            url: issue?.key ? `${this.options.baseUrl}/browse/${issue.key}` : "",
+        }));
+        const errors = requireOptionalArray(response.errors, "bulk create error list").map((error: any) => ({
+            // `failedElementNumber` is Jira's index into the request array, which
+            // is the only way to tell which of the submitted rows failed.
+            index: typeof error?.failedElementNumber === "number" ? error.failedElementNumber : -1,
+            message: [
+                ...(Array.isArray(error?.elementErrors?.errorMessages) ? error.elementErrors.errorMessages : []),
+                ...Object.entries(error?.elementErrors?.errors || {}).map(([field, text]) => `${field}: ${text}`),
+            ].join("; ") || "Jira reported a failure with no message.",
+        }));
+        return { requested: issues.length, created, failed: errors };
+    }
+    /**
+     * Lists an issue's remote links: the web links Jira shows under "Links"
+     * that point outside Jira (Confluence pages, documents, dashboards).
+     * These live on their own endpoint and are invisible to `getIssueLinks`,
+     * which only sees issue-to-issue relationships.
+     */
+    async listRemoteLinks(issueKey: string): Promise<JiraRemoteLink[]> {
+        const links = await atlassianGet({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/2/issue/${encodeURIComponent(issueKey)}/remotelink`,
+        });
+        return requireOptionalArray(links, `remote link list on issue ${issueKey}`).map((link: any) => ({
+            id: String(link?.id ?? ""),
+            globalId: link?.globalId || "",
+            title: link?.object?.title || "",
+            url: link?.object?.url || "",
+            relationship: link?.relationship || "",
+            applicationName: link?.application?.name || "",
+        }));
+    }
+    /** Attaches an external URL to an issue. Mutates data: POST …/remotelink. */
+    async createRemoteLink(issueKey: string, options: {
+        url: string;
+        title: string;
+        summary?: string;
+        relationship?: string;
+        globalId?: string;
+    }): Promise<JiraRemoteLink> {
+        const created = await atlassianPost({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/2/issue/${encodeURIComponent(issueKey)}/remotelink`,
+            body: {
+                globalId: options.globalId,
+                relationship: options.relationship,
+                object: {
+                    url: options.url,
+                    title: options.title,
+                    summary: options.summary,
+                },
+            },
+        });
+        return {
+            id: String(created?.id ?? ""),
+            globalId: created?.globalId || options.globalId || "",
+            title: options.title,
+            url: options.url,
+            relationship: options.relationship || "",
+            applicationName: "",
+        };
+    }
+    async deleteRemoteLink(issueKey: string, linkId: string): Promise<JiraDeleteResult> {
+        await atlassianDelete({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/2/issue/${encodeURIComponent(issueKey)}/remotelink/${encodeURIComponent(linkId)}`,
+        });
+        return { id: linkId, deleted: true };
+    }
+    /**
+     * Sends an ad-hoc notification about an issue. Mutates the world rather
+     * than the data: recipients receive real email, so the tool exposing this
+     * names every audience explicitly instead of accepting a free-form group.
+     */
+    async notifyIssue(issueKey: string, options: {
+        subject: string;
+        body: string;
+        toUsernames?: string[];
+        toGroups?: string[];
+        toReporter?: boolean;
+        toAssignee?: boolean;
+        toWatchers?: boolean;
+    }): Promise<JiraNotifyResult> {
+        const recipients: Record<string, unknown> = {};
+        if (options.toReporter) recipients.reporter = true;
+        if (options.toAssignee) recipients.assignee = true;
+        if (options.toWatchers) recipients.watchers = true;
+        if (options.toUsernames?.length) {
+            recipients.users = options.toUsernames.map((name) => ({ name }));
+        }
+        if (options.toGroups?.length) {
+            recipients.groups = options.toGroups.map((name) => ({ name }));
+        }
+        if (Object.keys(recipients).length === 0) {
+            throw new Error("A notification needs at least one recipient.");
+        }
+        await atlassianPost({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/2/issue/${encodeURIComponent(issueKey)}/notify`,
+            body: { subject: options.subject, textBody: options.body, to: recipients },
+        });
+        return { issueKey, notified: true, recipients: Object.keys(recipients) };
+    }
+    async getIssueVotes(issueKey: string): Promise<JiraVoteSummary> {
+        const response = requireResponseObject(await atlassianGet({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/2/issue/${encodeURIComponent(issueKey)}/votes`,
+        }), `vote response for issue ${issueKey}`);
+        return {
+            issueKey,
+            votes: typeof response.votes === "number" ? response.votes : 0,
+            hasVoted: response.hasVoted === true,
+            voters: requireOptionalArray(response.voters, `voter list on issue ${issueKey}`)
+                .map((voter: any) => userLabel(voter)),
+        };
+    }
+    async setIssueVote(issueKey: string, vote: boolean): Promise<JiraVoteResult> {
+        const request = vote ? atlassianPost : atlassianDelete;
+        await request({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/2/issue/${encodeURIComponent(issueKey)}/votes`,
+        });
+        return { issueKey, voted: vote };
+    }
+    /**
+     * Edits an existing worklog entry. Mutates data: PUT
+     * /rest/api/2/issue/{key}/worklog/{id}. Jira replaces the entry, so the
+     * caller's omitted fields are re-sent from the current values instead of
+     * being cleared.
+     */
+    async updateWorklog(issueKey: string, worklogId: string, options: {
+        timeSpent?: string;
+        comment?: string;
+        started?: string;
+    }): Promise<JiraWorklogResult> {
+        const existing = (await this.listWorklogs(issueKey)).find((entry) => entry.id === worklogId);
+        if (!existing) {
+            throw new Error(`Worklog ${worklogId} was not found on issue ${issueKey}.`);
+        }
+        const body: Record<string, any> = {
+            timeSpent: options.timeSpent ?? existing.timeSpent,
+            comment: options.comment ?? existing.comment,
+        };
+        if (options.started !== undefined) {
+            body.started = toJiraWorklogStarted(options.started);
+        }
+        const updated = await atlassianPut({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/2/issue/${encodeURIComponent(issueKey)}/worklog/${encodeURIComponent(worklogId)}`,
+            body,
+        });
+        return {
+            id: updated?.id || worklogId,
+            issueKey,
+            author: userLabel(updated?.author),
+            timeSpent: updated?.timeSpent || body.timeSpent,
+            started: updated?.started || "",
+            comment: updated?.comment || body.comment || "",
+        };
+    }
+    /** Lists the property keys stored on an issue (ProForma uses these too). */
+    async listIssueProperties(issueKey: string): Promise<string[]> {
+        const response = requireResponseObject(await atlassianGet({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/2/issue/${encodeURIComponent(issueKey)}/properties`,
+        }), `property list response for issue ${issueKey}`);
+        return requireOptionalArray(response.keys, `property key list on issue ${issueKey}`)
+            .map((entry: any) => entry?.key || "")
+            .filter((key: string) => key !== "");
+    }
+    /**
+     * Writes an issue property. Mutates data: PUT
+     * /rest/api/2/issue/{key}/properties/{propertyKey}.
+     *
+     * Issue properties are where apps keep their own state — ProForma's form
+     * data lives here — so overwriting one can corrupt an app's records. That
+     * is why the tool exposing this is registered as destructive.
+     */
+    async setIssueProperty(issueKey: string, propertyKey: string, value: unknown): Promise<JiraIssuePropertyResult> {
+        await atlassianPut({
+            baseUrl: this.options.baseUrl,
+            pat: this.options.pat,
+            path: `/rest/api/2/issue/${encodeURIComponent(issueKey)}/properties/${encodeURIComponent(propertyKey)}`,
+            body: value,
+        });
+        return { issueKey, propertyKey, stored: true };
+    }
 }
+
+/** Jira's bulk endpoint refuses more than 50 issues in one request. */
+const MAX_BULK_ISSUES = 50;
