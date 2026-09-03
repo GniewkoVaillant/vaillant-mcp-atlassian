@@ -109,7 +109,7 @@ async function main() {
     const server = new McpServer(
         {
             name: "mcp-atlassian",
-            version: "1.1.0",
+            version: "1.2.0",
         },
         {
             // Declaring the logging capability lets tool invocations show up in

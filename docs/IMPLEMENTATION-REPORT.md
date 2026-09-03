@@ -410,6 +410,24 @@ Five tests remain Windows-incompatible by nature (FIFO, unix domain socket and
 character-device refusal, colon-delimited path parsing); Linux/CI is the
 authoritative gate.
 
+### Versioning
+
+Released as **1.2.0**. The change is large but strictly additive: no tool was
+removed, no input schema narrowed, and no existing tool's behaviour changed, so
+a minor bump is correct rather than a major one. Two caveats an upgrader should
+know:
+
+- `ATLASSIAN_PROFILE=ppm` and `=agile` now resolve to more groups than before
+  (`meta` and `users` were added to both), so an unchanged configuration gets a
+  larger tools/list payload after the upgrade. `ATLASSIAN_PROFILE=classic`
+  reproduces the previous surface exactly.
+- The default `full` profile roughly triples in size. This is the single change
+  most likely to be felt, and it is a context-cost change, not a behavioural one.
+
+The version was also drifting: `package.json` said 1.1.1 while the MCP handshake
+still announced 1.1.0, so every client logged a version matching no release.
+`serverPolicy.test.ts` now asserts the two agree.
+
 ### Verified results
 
 | Check | Result |

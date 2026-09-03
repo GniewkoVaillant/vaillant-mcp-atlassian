@@ -1,5 +1,6 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -43,6 +44,44 @@ async function withServer(
     await client.close();
   }
 }
+
+describe("server identity", () => {
+  test("the version reported over MCP matches the published package version", async () => {
+    // These drifted apart once already: package.json said 1.1.1 while the
+    // handshake still announced 1.1.0, so every client logged a version that
+    // corresponded to no release. A hard-coded literal only stays correct if
+    // something checks it.
+    const packageJson = JSON.parse(
+      await readFile(fileURLToPath(new URL("../../package.json", import.meta.url)), "utf8"),
+    ) as { version: string };
+
+    const inherited = Object.fromEntries(
+      Object.entries(process.env).filter(
+        ([key, value]) => value !== undefined && !key.startsWith("ATLASSIAN_"),
+      ),
+    ) as Record<string, string>;
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [SERVER_ENTRYPOINT],
+      env: {
+        ...inherited,
+        JIRA_BASE_URL: "https://jira.example.test",
+        JIRA_PAT: "synthetic-jira-token",
+        CONFLUENCE_BASE_URL: "https://confluence.example.test",
+        CONFLUENCE_PAT: "synthetic-confluence-token",
+      },
+      stderr: "pipe",
+    });
+    const client = new Client({ name: "server-version-test", version: "1.0.0" });
+
+    try {
+      await client.connect(transport);
+      assert.equal(client.getServerVersion()?.version, packageJson.version);
+    } finally {
+      await client.close();
+    }
+  });
+});
 
 describe("server-enforced MCP tool safety policy", () => {
   test("destructive tools are neither listed nor callable by default", async () => {
