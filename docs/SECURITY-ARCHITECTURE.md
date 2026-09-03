@@ -308,8 +308,11 @@ Run `npm run build`, `npm run test:unit`, and the stdio smoke test. Unit tests
 cover synthetic HTTP retry/timeout behavior, queue/concurrency budgets, URL and
 configuration validation, attachment traversal/symlink/size protections,
 pagination safety, MCP tool exposure, and the version-dependent Data Center
-fallbacks (`createmeta`, filter search, filter favourites). Never place real
-PATs in fixtures.
+fallbacks (`createmeta`, filter search, filter favourites). `toolSurface.test.ts`
+additionally boots the built server over stdio against a stub Data Center and
+drives the tools through MCP, which is what verifies the schemas, the
+cross-field preconditions and the error path rather than the clients alone.
+Never place real PATs in fixtures.
 
 New Data Center response parsing must go through the typed readers in
 `upstreamShape.ts` (`readString`, `readId`, `readNumber`, `readArray`,

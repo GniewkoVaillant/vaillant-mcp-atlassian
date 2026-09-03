@@ -391,7 +391,40 @@ against the *next* version number rather than the current one, so restoring the
 live version would have been accepted: a no-op PUT that burns a page version and
 notifies every watcher. The regression test now pins the correct comparison.
 
-### Test-suite portability and determinism
+### Testing the tool surface, not just the clients
+
+The unit tests exercise the clients directly, which left the layer the model
+actually touches untested: MCP registration, the Zod schemas, the cross-field
+`validate` preconditions, the mapping of a client result into a tool result, and
+the error path. A tool can be correct at the client level and still be
+unreachable, wired to the wrong method, or hidden by its profile.
+
+`toolSurface.test.ts` therefore boots the **built server over stdio**, points it
+at a stub that answers like a Data Center instance, and drives 28 checks through
+the MCP protocol — the same path a model takes. It covers a representative slice
+of every new area, and asserts the things that are invisible from the client
+layer: that a malformed issue key is refused by the schema *before* any request
+reaches the network, that `jira_notify_issue` cannot send mail without a
+recipient, that `jsm_add_request_comment` will not default the customer-visibility
+decision, that the JSM experimental header travels with the request without
+displacing the configured identity, that an upstream 404 becomes a readable
+error result rather than a crash, and that a malformed payload names the
+resource instead of raising a `TypeError`.
+
+**The suite was then checked for teeth.** Three deliberate defects were
+introduced one at a time and each was caught by exactly the test that should
+have caught it:
+
+| Injected defect | Detected by |
+|---|---|
+| `createmeta` allowed-value cap raised from 50 to 500 | `jira_get_create_meta` payload-cap assertion |
+| JSM `X-ExperimentalApi` header dropped | `jsm_add_request_comment` header assertion |
+| Historical storage markup re-escaped on version restore | `confluence_restore_page_version` macro-survival assertion |
+
+All three files were restored and verified byte-identical to the committed
+version afterwards.
+
+
 
 The suite could not honestly gate anything on Windows, and part of it could not
 gate anything anywhere.
@@ -453,9 +486,11 @@ still announced 1.1.0, so every client logged a version matching no release.
 |---|---|
 | Strict TypeScript check | `tsc -p tsconfig.json --noEmit` passed |
 | Lint | `npx eslint . --max-warnings 91`: 0 errors, 91 warnings — two *below* the pre-existing CI ceiling, which was lowered to match |
-| Unit tests | 482 tests; 467 passed; **0 failed**; 15 skipped, each with a recorded capability reason |
+| Unit tests | 510 tests; 495 passed; **0 failed**; 15 skipped, each with a recorded capability reason |
+| End-to-end tool surface | 28 checks driving the built server over stdio through MCP against a stub Data Center; all pass |
+| Mutation check | 3 deliberate defects injected one at a time, each caught by the intended assertion; all files restored byte-identical |
 | Determinism | The `httpClient` timeout suite was intermittently red — 2 failures across 5 runs, on `main` as well. After the rewrite it passed 8 consecutive runs, then three consecutive full-gate runs |
-| New tests | 37 added across `jiraExtendedClients.test.ts`, `confluenceExtended.test.ts`, `config.test.ts`, `httpClient.test.ts` and `serverPolicy.test.ts` |
+| New tests | 65 added across `jiraExtendedClients.test.ts`, `confluenceExtended.test.ts`, `toolSurface.test.ts`, `config.test.ts`, `httpClient.test.ts` and `serverPolicy.test.ts` |
 | Default MCP surface | 133 tools; approximately 30,200 tokens |
 | `classic` profile | 86 tools; approximately 20,100 tokens |
 | `ppm` profile | 94 tools; approximately 21,100 tokens |
